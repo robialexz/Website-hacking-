@@ -18,10 +18,15 @@
     { "name": "admin", "role": "admin" }
   ],
   "approvedCallbacks": [],
+  "publicReadOnlyPages": [],
   "budgets": {
     "maxRequestsPerAudit": 32,
     "maxConcurrentAudits": 1,
-    "timeoutMs": 2500
+    "timeoutMs": 2500,
+    "maxSourceFiles": 500,
+    "maxSourceBytes": 2000000,
+    "maxPublicPages": 4,
+    "maxPublicBytesPerPage": 1000000
   },
   "resetProcedure": "POST /api/lab/profile with {\"profile\":\"vulnerable\"} or {\"profile\":\"secure\"} resets synthetic state. No real data is used."
 }

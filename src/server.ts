@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { basename, extname, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { executeAudit, isCompleteRetest } from "./audit.ts";
@@ -11,6 +11,8 @@ import { createLabState, handleLabRequest, resetLabState } from "./lab-target.ts
 import type { LabProfile } from "./lab-target.ts";
 import { loadScopeConfig } from "./scope.ts";
 import type { ScopeConfig } from "./scope.ts";
+import { executeSourceReview } from "./source-review.ts";
+import { executePublicReview } from "./public-review.ts";
 
 const HOST = "127.0.0.1";
 const PORT = 8765;
@@ -44,7 +46,8 @@ db.exec(`
     started_at TEXT,
     finished_at TEXT,
     error TEXT,
-    coverage_json TEXT NOT NULL DEFAULT '[]'
+    coverage_json TEXT NOT NULL DEFAULT '[]',
+    scope_json TEXT NOT NULL DEFAULT '{}'
   );
   CREATE INDEX IF NOT EXISTS jobs_created_at_idx ON jobs(created_at DESC);
   CREATE TABLE IF NOT EXISTS findings (
@@ -84,6 +87,10 @@ db.exec(`
     value TEXT NOT NULL
   );
 `);
+const jobColumns = db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name?: string }>;
+if (!jobColumns.some((column) => column.name === "scope_json")) {
+  db.exec("ALTER TABLE jobs ADD COLUMN scope_json TEXT NOT NULL DEFAULT '{}'");
+}
 
 const savedProfile = db.prepare("SELECT value FROM settings WHERE key = 'lab_profile'").get() as { value?: string } | undefined;
 let currentProfile: LabProfile = savedProfile?.value === "secure" ? "secure" : "vulnerable";
@@ -103,6 +110,16 @@ function setSetting(key: string, value: string): void {
 function addLog(jobId: string, level: string, message: string): void {
   db.prepare("INSERT INTO execution_logs(job_id, created_at, level, message) VALUES(?, ?, ?, ?)")
     .run(jobId, now(), level, message.slice(0, 500));
+}
+
+const interruptedJobs = db.prepare("SELECT id FROM jobs WHERE status IN ('queued', 'running')").all() as Array<{ id?: string }>;
+if (interruptedJobs.length) {
+  const finishedAt = now();
+  db.prepare("UPDATE jobs SET status = 'failed', finished_at = ?, error = ? WHERE status IN ('queued', 'running')")
+    .run(finishedAt, "Stopped on app restart; start a new run to confirm the current scope.");
+  for (const job of interruptedJobs) {
+    if (job.id) addLog(job.id, "warning", "This queued or interrupted run was not replayed after restart. Start a new run explicitly.");
+  }
 }
 
 function json(res: ServerResponse, status: number, value: unknown): void {
@@ -128,6 +145,10 @@ function escapeHtml(value: unknown): string {
 
 function safeJson(value: string, fallback: unknown): unknown {
   try { return JSON.parse(value); } catch { return fallback; }
+}
+
+function sourceDirectoryLabel(value: string): string {
+  return isAbsolute(value) ? `${basename(dirname(value))}/${basename(value)}` : value;
 }
 
 function localSocket(req: IncomingMessage): boolean {
@@ -199,10 +220,14 @@ function rowToFinding(row: Record<string, unknown>): Record<string, unknown> {
 }
 
 function rowToJob(row: Record<string, unknown>): Record<string, unknown> {
+  const action = String(row.action);
   return {
     id: row.id,
-    action: row.action,
-    label: row.action === "retest" ? "Secure-profile retest" : "Local security audit",
+    action,
+    label: action === "retest" ? "Secure-profile retest"
+      : action === "source-review" ? "Approved source review"
+      : action === "public-review" ? "Passive public page review"
+      : "Local security audit",
     profile: row.profile,
     status: row.status,
     createdAt: row.created_at,
@@ -273,13 +298,28 @@ function storeResult(jobId: string, action: string, profile: LabProfile, result:
 async function runJob(jobId: string): Promise<void> {
   const row = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId) as Record<string, unknown> | undefined;
   if (!row) return;
+  const action = String(row.action);
   const profile = row.profile === "secure" ? "secure" : "vulnerable";
+  if (typeof row.scope_json !== "string" || row.scope_json !== JSON.stringify(scope)) {
+    db.prepare("UPDATE jobs SET status = 'failed', finished_at = ?, error = ? WHERE id = ?")
+      .run(now(), "Approved scope changed; start a new run against the current scope.", jobId);
+    addLog(jobId, "warning", "Run stopped because its saved scope does not match the active approved scope.");
+    return;
+  }
   db.prepare("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?").run(now(), jobId);
-  addLog(jobId, "info", `Started ${row.action} against the local synthetic demo (${profile} profile).`);
+  addLog(jobId, "info", action === "source-review"
+    ? `Started a read-only static review of approved source directories: ${scope.sourceDirectories.map(sourceDirectoryLabel).join(", ")}.`
+    : action === "public-review"
+      ? `Started a passive review of ${scope.publicReadOnlyPages.length} exact HTTPS page(s); one GET per page, no redirects or page assets.`
+      : `Started ${action} against the local synthetic demo (${profile} profile).`);
   try {
-    const jobScope = loadScopeConfig(SCOPE_PATH);
-    const result = await executeAudit({ scope: jobScope, targetLabel: "RevenueGuard local demo" });
-    storeResult(jobId, String(row.action), profile, result);
+    const jobScope = scope;
+    const result = action === "source-review"
+      ? await executeSourceReview({ scope: jobScope, projectRoot: ROOT })
+      : action === "public-review"
+        ? await executePublicReview({ scope: jobScope })
+        : await executeAudit({ scope: jobScope, targetLabel: "RevenueGuard local demo" });
+    storeResult(jobId, action, profile, result);
     const confirmed = result.findings.filter((finding) => finding.status === "CONFIRMED").length;
     const suspected = result.findings.filter((finding) => finding.status === "SUSPECTED").length;
     addLog(jobId, "info", `Completed ${result.coverage.length} checks: ${confirmed} confirmed, ${suspected} suspected.`);
@@ -304,17 +344,25 @@ async function drainQueue(): Promise<void> {
   }
 }
 
-function enqueueJob(action: "audit" | "retest"): Record<string, unknown> {
+function enqueueJob(action: "audit" | "retest" | "source-review" | "public-review", confirmPublicGet = false): Record<string, unknown> {
   const active = db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE status IN ('queued', 'running')").get() as { count?: number };
   if (Number(active.count || 0) >= MAX_QUEUED_JOBS) throw new Error("The local queue is full. Wait for a run to finish.");
   if (action === "retest" && currentProfile !== "secure") throw new Error("Switch the demo profile to Secure controls before retesting.");
+  if ((action === "audit" || action === "retest") && !scope.approvedServices.includes("revenueguard-demo")) throw new Error("Enable revenueguard-demo in approvedServices before starting a local audit.");
+  if (action === "source-review" && !scope.approvedServices.includes("source-review")) throw new Error("Enable source-review in approvedServices before reviewing local source.");
+  if (action === "public-review" && !scope.approvedServices.includes("passive-public-review")) throw new Error("Enable passive-public-review in approvedServices before reviewing public pages.");
+  if (action === "public-review" && scope.publicReadOnlyPages.length === 0) throw new Error("Add exact HTTPS pages to publicReadOnlyPages in scope.json before starting a public page review.");
+  if (action === "public-review" && !confirmPublicGet) throw new Error("Confirm that each listed page is authorized and safe to request with one unauthenticated GET.");
   const id = randomUUID();
   const createdAt = now();
-  db.prepare("INSERT INTO jobs(id, action, profile, status, created_at, coverage_json) VALUES(?, ?, ?, 'queued', ?, '[]')")
-    .run(id, action, currentProfile, createdAt);
-  addLog(id, "info", `Queued ${action} in ${currentProfile} profile.`);
+  const profile = action === "source-review" ? "approved-source" : action === "public-review" ? "approved-public" : currentProfile;
+  db.prepare("INSERT INTO jobs(id, action, profile, status, created_at, coverage_json, scope_json) VALUES(?, ?, ?, 'queued', ?, '[]', ?)")
+    .run(id, action, profile, createdAt, JSON.stringify(scope));
+  addLog(id, "info", action === "source-review" ? "Queued static review of approved local source files."
+    : action === "public-review" ? `Queued passive GET review of ${scope.publicReadOnlyPages.length} exact HTTPS page(s).`
+    : `Queued ${action} in ${profile} profile.`);
   setImmediate(() => { void drainQueue(); });
-  return { id, action, profile: currentProfile, status: "queued", createdAt };
+  return { id, action, profile, status: "queued", createdAt };
 }
 
 function dashboardData(): Record<string, unknown> {
@@ -338,13 +386,23 @@ function dashboardData(): Record<string, unknown> {
       totalFindings: Number(counts.total || 0),
       jobs: Number(jobCount.count || 0),
       checksAttempted: coverage.filter((item) => item.attempted).length,
-      checksAvailable: CHECK_COUNT,
+      checksAvailable: coverage.length || CHECK_COUNT,
     },
     scope: {
       origins: scope.approvedOrigins,
       paths: scope.approvedPathPrefixes,
+      services: scope.approvedServices,
+      sourceDirectories: scope.sourceDirectories.map(sourceDirectoryLabel),
+      testAccounts: scope.testAccounts,
+      callbacks: scope.approvedCallbacks,
+      publicPages: scope.publicReadOnlyPages,
+      resetProcedure: scope.resetProcedure,
       maxRequests: scope.budgets.maxRequestsPerAudit,
       timeoutMs: scope.budgets.timeoutMs,
+      maxSourceFiles: scope.budgets.maxSourceFiles,
+      maxSourceBytes: scope.budgets.maxSourceBytes,
+      maxPublicPages: scope.budgets.maxPublicPages,
+      maxPublicBytesPerPage: scope.budgets.maxPublicBytesPerPage,
     },
     jobs: jobs.map(rowToJob),
     findings: findings.map(rowToFinding),
@@ -356,21 +414,39 @@ function logsFor(jobId: string): Array<Record<string, unknown>> {
     .all(jobId) as Array<Record<string, unknown>>;
 }
 
-function reportsFor(jobId: string): { job: Record<string, unknown>; findings: Array<Record<string, unknown>>; logs: Array<Record<string, unknown>> } | undefined {
+function reportsFor(jobId: string): { job: Record<string, unknown>; findings: Array<Record<string, unknown>>; logs: Array<Record<string, unknown>>; scopeSnapshot: Record<string, unknown> } | undefined {
   const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId) as Record<string, unknown> | undefined;
   if (!job) return undefined;
   const findings = db.prepare("SELECT * FROM findings WHERE job_id = ? ORDER BY severity, finding_key")
     .all(jobId) as Array<Record<string, unknown>>;
-  return { job: rowToJob(job), findings: findings.map(rowToFinding), logs: logsFor(jobId) };
+  const savedScope = safeJson(String(job.scope_json || "{}"), {});
+  return {
+    job: rowToJob(job),
+    findings: findings.map(rowToFinding),
+    logs: logsFor(jobId),
+    scopeSnapshot: savedScope !== null && typeof savedScope === "object" && !Array.isArray(savedScope)
+      ? savedScope as Record<string, unknown>
+      : {},
+  };
 }
 
 function reportHtml(kind: string, data: NonNullable<ReturnType<typeof reportsFor>>): string {
-  const { job, findings, logs } = data;
+  const { job, findings, logs, scopeSnapshot } = data;
+  const sourceReview = job.action === "source-review";
+  const publicReview = job.action === "public-review";
   const confirmed = findings.filter((finding) => finding.status === "CONFIRMED");
   const suspected = findings.filter((finding) => finding.status === "SUSPECTED");
-  const title = kind === "executive" ? "Executive summary" : kind === "remediation" ? "Remediation and retest" : "Technical evidence";
+  const title = publicReview
+    ? kind === "executive" ? "Public page review summary" : kind === "remediation" ? "Page improvement notes" : "Public page review evidence"
+    : sourceReview
+      ? kind === "executive" ? "Source review summary" : kind === "remediation" ? "Source remediation notes" : "Source review evidence"
+      : kind === "executive" ? "Executive summary" : kind === "remediation" ? "Remediation and retest" : "Technical evidence";
   const summary = kind === "executive"
-    ? `<p>This report describes a local synthetic demonstration. It does not establish customer impact or lost revenue in any real business.</p><p><b>${confirmed.length}</b> confirmed lab behavior(s), <b>${suspected.length}</b> suspected marker(s), and <b>${(job.coverage as CoverageItem[]).length}</b> checks attempted.</p>`
+    ? publicReview
+      ? `<p>This report contains passive observations from exact public HTTPS pages in scope.json. It does not contain vulnerability probes or prove a security issue.</p><p><b>${suspected.length}</b> suspected page-level observation(s), and <b>${(job.coverage as CoverageItem[]).filter((item) => item.attempted).length}</b> checks attempted.</p>`
+      : sourceReview
+      ? `<p>This report contains read-only static pattern matches from approved local source directories. It does not prove runtime reachability or exploitability.</p><p><b>${suspected.length}</b> suspected pattern(s), and <b>${(job.coverage as CoverageItem[]).filter((item) => item.attempted).length}</b> checks attempted.</p>`
+      : `<p>This report describes a local synthetic demonstration. It does not establish customer impact or lost revenue in any real business.</p><p><b>${confirmed.length}</b> confirmed lab behavior(s), <b>${suspected.length}</b> suspected marker(s), and <b>${(job.coverage as CoverageItem[]).length}</b> checks attempted.</p>`
     : "";
   const details = findings.map((raw) => {
     const item = raw as Record<string, unknown>;
@@ -379,10 +455,26 @@ function reportHtml(kind: string, data: NonNullable<ReturnType<typeof reportsFor
     const remediation = kind === "remediation" ? `<h4>Remediation</h4><p>${escapeHtml(item.remediation)}</p><h4>Retest</h4><p>${escapeHtml(item.retestStatus)}</p>` : "";
     return `<article class="finding"><div class="meta"><span>${escapeHtml(item.findingKey)}</span><span>${escapeHtml(item.severity)}</span><span>${escapeHtml(item.status)}</span><span>${escapeHtml(item.confidence)} confidence</span></div><h2>${escapeHtml(item.title)}</h2><p class="category">${escapeHtml(item.category)} · ${escapeHtml(item.endpoint)}</p><h4>Expected</h4><p>${escapeHtml(item.expected)}</p><h4>Observed</h4><p>${escapeHtml(item.actual)}</p><h4>Impact and limits</h4><p>${escapeHtml(item.impact)}</p><h4>Reproduction</h4><ol>${reproduction}</ol>${remediation}<details><summary>Evidence</summary><pre>${evidenceText}</pre></details></article>`;
   }).join("");
-  const coverageItems = (job.coverage as CoverageItem[]).map((item) => `<li><b>${escapeHtml(item.label)}</b>: ${escapeHtml(item.status)}${item.error ? ` — ${escapeHtml(item.error)}` : ""}</li>`).join("");
+  const coverageItems = (job.coverage as CoverageItem[]).map((item) => `<li><b>${escapeHtml(item.label)}</b>: ${escapeHtml(item.status)}${item.details ? ` — ${escapeHtml(item.details)}` : ""}${item.error ? ` — ${escapeHtml(item.error)}` : ""}</li>`).join("");
+  const publicPages = Array.isArray(scopeSnapshot.publicReadOnlyPages)
+    ? scopeSnapshot.publicReadOnlyPages.filter((page): page is string => typeof page === "string")
+    : [];
+  const publicScopeItems = publicReview && publicPages.length
+    ? `<section><h2>Exact pages in this run's scope</h2><ul>${publicPages.map((page) => `<li>${escapeHtml(page)}</li>`).join("")}</ul></section>`
+    : "";
   const logItems = logs.map((item) => `<li><time>${escapeHtml(item.created_at)}</time> · ${escapeHtml(item.level)} · ${escapeHtml(item.message)}</li>`).join("");
-  const empty = findings.length ? "" : "<p class=empty>No findings were stored for this run. Consult coverage to distinguish clean controls from checks that were not reproduced.</p>";
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · RevenueGuard Lab</title><link rel="stylesheet" href="/report.css"><script src="/report.js" defer></script></head><body><main><header><div><p class="eyebrow">REVENUEGUARD LAB · LOCAL SYNTHETIC TARGET</p><h1>${escapeHtml(title)}</h1><p class="sub">Run ${escapeHtml(job.id)} · ${escapeHtml(job.profile)} profile · ${escapeHtml(job.status)}</p></div><button id="print">Print / Save as PDF</button></header><section class="notice"><b>Scope note:</b> this report contains evidence from a local demo app with synthetic users, records, and files. It is not proof that another application is vulnerable or secure.</section>${summary}<section><h2>Coverage</h2><ul>${coverageItems || "<li>No checks were recorded.</li>"}</ul></section><section><h2>Findings</h2>${empty}${details}</section><section><h2>Execution log</h2><ul>${logItems || "<li>No log entries.</li>"}</ul></section><footer>Generated locally · ${escapeHtml(now())}</footer></main></body></html>`;
+  const empty = findings.length ? "" : publicReview
+    ? "<p class=empty>No page-level observations matched the listed checks. This is not a vulnerability scan or an overall security guarantee.</p>"
+    : sourceReview
+    ? "<p class=empty>No static patterns matched. This heuristic review is limited to the listed checks and is not proof that the source is secure.</p>"
+    : "<p class=empty>No findings were stored for this run. Consult coverage to distinguish clean controls from checks that were not reproduced.</p>";
+  const scopeLabel = publicReview ? "PUBLIC PAGE REVIEW" : sourceReview ? "APPROVED LOCAL SOURCE" : "LOCAL SYNTHETIC TARGET";
+  const scopeNote = publicReview
+    ? "One unauthenticated GET was made per exact HTTPS page listed below. GET requests can still trigger side effects on some sites; only include pages known to be safe to request. No redirects, cookies, forms, assets, or page links were followed. The HTML body was parsed in memory and was not stored."
+    : sourceReview
+    ? "This report contains read-only static pattern matches from the explicitly approved local source directories in scope.json. It does not execute source code or prove runtime exploitability."
+    : "This report contains evidence from a local demo app with synthetic users, records, and files. It is not proof that another application is vulnerable or secure.";
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · RevenueGuard Lab</title><link rel="stylesheet" href="/report.css"><script src="/report.js" defer></script></head><body><main><header><div><p class="eyebrow">REVENUEGUARD LAB · ${scopeLabel}</p><h1>${escapeHtml(title)}</h1><p class="sub">Run ${escapeHtml(job.id)} · ${escapeHtml(job.profile)} · ${escapeHtml(job.status)}</p></div><button id="print">Print / Save as PDF</button></header><section class="notice"><b>Scope note:</b> ${escapeHtml(scopeNote)}</section>${summary}${publicScopeItems}<section><h2>Coverage</h2><ul>${coverageItems || "<li>No checks were recorded.</li>"}</ul></section><section><h2>Findings</h2>${empty}${details}</section><section><h2>Execution log</h2><ul>${logItems || "<li>No log entries.</li>"}</ul></section><footer>Generated locally · ${escapeHtml(now())}</footer></main></body></html>`;
 }
 
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -437,7 +529,16 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
 
   if (url.pathname === "/api/health" && req.method === "GET") {
-    json(res, 200, { ok: true, mode: "laboratory", bind: HOST, externalNetwork: false });
+    const publicReviewEnabled = scope.approvedServices.includes("passive-public-review") && scope.publicReadOnlyPages.length > 0;
+    json(res, 200, {
+      ok: true,
+      mode: "laboratory",
+      bind: HOST,
+      externalNetwork: publicReviewEnabled,
+      publicReviewEnabled,
+      publicRequests: "one GET per exact approved HTTPS page, only after a local user confirms and starts a review",
+      dynamicAuditExternalNetwork: false,
+    });
     return;
   }
 
@@ -455,8 +556,8 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (url.pathname === "/api/jobs" && req.method === "POST") {
     const body = await readJson(req);
     const action = body.action;
-    if (action !== "audit" && action !== "retest") { json(res, 400, { error: "Action must be audit or retest" }); return; }
-    try { json(res, 202, enqueueJob(action)); }
+    if (action !== "audit" && action !== "retest" && action !== "source-review" && action !== "public-review") { json(res, 400, { error: "Action must be audit, retest, source-review, or public-review" }); return; }
+    try { json(res, 202, enqueueJob(action, body.confirmPublicGet === true)); }
     catch (error) { json(res, 409, { error: error instanceof Error ? error.message : "Could not queue audit" }); }
     return;
   }
@@ -494,7 +595,6 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   text(res, 404, "Not found");
 }
 
-db.prepare("UPDATE jobs SET status = 'queued', started_at = NULL WHERE status = 'running'").run();
 const server = createServer((req, res) => {
   void route(req, res).catch((error) => {
     if (res.headersSent) { res.destroy(); return; }
@@ -508,7 +608,7 @@ const server = createServer((req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`RevenueGuard Lab is available at ${ORIGIN}`);
-  console.log("Scope: loopback-only synthetic demo; no external targets or callbacks.");
+  console.log("Scope: active checks stay loopback-only; optional public review uses only exact HTTPS pages in scope.json; callbacks are disabled.");
   void drainQueue();
 });
 

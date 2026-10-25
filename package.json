@@ -1,9 +1,9 @@
 {
   "name": "revenueguard-lab",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Offline-first, loopback-only web security validation lab",
+  "description": "Offline-first security lab with loopback checks, local source review, and confirmed bounded public-page GETs",
   "scripts": {
     "start": "node src/server.ts",
     "test": "node --test src/*.test.ts"

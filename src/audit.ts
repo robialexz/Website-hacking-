@@ -5,8 +5,10 @@ export type FindingStatus = "CONFIRMED" | "SUSPECTED" | "NOT REPRODUCED" | "NOT 
 export type Severity = "Critical" | "High" | "Medium" | "Low" | "Info";
 
 export interface AuditEvidence {
-  request: { method: string; url: string; headers: Record<string, string>; body?: string };
+  request?: { method: string; url: string; headers: Record<string, string>; body?: string };
   response?: { status: number; contentType: string; body: string };
+  source?: { path: string; line: number; excerpt: string; sha256: string };
+  page?: { url: string; status: number; contentType: string; elapsedMs: number; bytes: number; headers: Record<string, string> };
   note?: string;
 }
 
@@ -37,6 +39,7 @@ export interface CoverageItem {
   attempted: boolean;
   status: "CONFIRMED" | "SUSPECTED" | "NOT REPRODUCED" | "NOT TESTED";
   controlVerified: boolean;
+  details?: string;
   error?: string;
 }
 

@@ -9,7 +9,17 @@ const scope: ScopeConfig = {
   mode: "laboratory",
   approvedOrigins: ["http://127.0.0.1:8765"],
   approvedPathPrefixes: ["/lab/"],
-  budgets: { maxRequestsPerAudit: 32, maxConcurrentAudits: 1, timeoutMs: 2500 },
+  approvedServices: ["revenueguard-demo", "source-review", "passive-public-review"],
+  sourceDirectories: ["./src"],
+  testAccounts: [
+    { name: "alice", role: "user" },
+    { name: "bob", role: "user" },
+    { name: "admin", role: "admin" },
+  ],
+  approvedCallbacks: [],
+  publicReadOnlyPages: [],
+  resetProcedure: "POST /api/lab/profile resets synthetic state.",
+  budgets: { maxRequestsPerAudit: 32, maxConcurrentAudits: 1, timeoutMs: 2500, maxSourceFiles: 500, maxSourceBytes: 2_000_000, maxPublicPages: 4, maxPublicBytesPerPage: 1_000_000 },
 };
 
 function transportFor(profile: "vulnerable" | "secure") {

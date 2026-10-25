@@ -1,4 +1,4 @@
-const state = { csrf: "", findings: new Map(), timer: null };
+const state = { csrf: "", findings: new Map(), publicPages: [], timer: null };
 const $ = (selector) => document.querySelector(selector);
 
 async function api(path, options = {}) {
@@ -48,7 +48,7 @@ function renderFindings(items, total = items.length) {
   $("#sideFindingCount").textContent = String(total);
   if (!items.length) {
     const row = node("tr");
-    const cell = node("td", "empty", "No findings yet. Run the local audit to inspect the demo app.");
+    const cell = node("td", "empty", "No findings yet. Run a local audit or an approved source or public page review.");
     cell.colSpan = 5;
     row.append(cell);
     body.append(row);
@@ -112,7 +112,8 @@ function renderJobs(items) {
     row.append(node("div", "job-icon", job.status === "running" ? "◌" : "✓"));
     const main = node("div", "job-main");
     main.append(node("b", "", job.label || "Local security audit"));
-    main.append(node("small", "", `${job.createdAt} · ${job.profile} profile`));
+    const profileLabel = job.profile === "approved-source" ? "approved source" : job.profile === "approved-public" ? "approved public pages" : `${job.profile} profile`;
+    main.append(node("small", "", `${job.createdAt} · ${profileLabel}`));
     row.append(main);
     const status = node("span", `job-status ${job.status}`, job.status);
     row.append(status);
@@ -140,16 +141,38 @@ async function refresh() {
     $("#coverageCount").textContent = `${data.summary.checksAttempted}/${data.summary.checksAvailable}`;
     $("#scopeOrigin").textContent = data.scope.origins.join(", ");
     $("#scopePaths").textContent = data.scope.paths.join(", ");
+    $("#scopeSources").textContent = data.scope.sourceDirectories.join(", ");
+    $("#scopeSourceBudget").textContent = `Read-only; up to ${data.scope.maxSourceFiles} files / ${Math.round(data.scope.maxSourceBytes / 1_000_000)} MB. No code execution or network access.`;
+    $("#scopePublicPages").textContent = data.scope.publicPages.join(", ") || "Not configured";
+    state.publicPages = data.scope.publicPages;
+    $("#scopePublicBudget").textContent = "One unauthenticated GET/page; max " + data.scope.maxPublicPages + " page(s), " + Math.round(data.scope.maxPublicBytesPerPage / 1_000_000) + " MB each. A GET can still trigger site actions; include only pages known safe to request.";
     $("#scopeBudget").textContent = `${data.scope.maxRequests} requests · ${data.scope.timeoutMs} ms timeout`;
+    $("#scopeAccounts").textContent = data.scope.testAccounts.map((account) => `${account.name} (${account.role})`).join(", ") || "None configured";
+    $("#scopeServices").textContent = data.scope.services.join(", ");
+    $("#scopeReset").textContent = data.scope.resetProcedure;
     $("#profileSelect").value = data.profile;
     $("#appVersion").textContent = `v${data.version}`;
     renderFindings(data.findings, data.summary.totalFindings);
     renderJobs(data.jobs);
     const active = data.jobs.some((job) => job.status === "queued" || job.status === "running");
+    const activeJob = data.jobs.find((job) => job.status === "queued" || job.status === "running");
     $("#runAuditButton").disabled = active;
     $("#retestButton").disabled = active || data.profile !== "secure" || data.summary.jobs === 0;
+    const sourceReviewEnabled = data.scope.services.includes("source-review");
+    const publicReviewEnabled = data.scope.services.includes("passive-public-review");
+    $("#sourceReviewButton").disabled = active || !sourceReviewEnabled;
+    $("#publicReviewButton").disabled = active || !publicReviewEnabled || data.scope.publicPages.length === 0;
     $("#profileSelect").disabled = active;
-    $("#runAuditButton").innerHTML = active ? "<span>◌</span> Audit in progress" : "<span>＋</span> Run local audit";
+    const activeLabel = activeJob?.action === "source-review" ? "Source review in progress"
+      : activeJob?.action === "public-review" ? "Public review in progress"
+      : activeJob?.action === "retest" ? "Retest in progress"
+      : "Audit in progress";
+    $("#runAuditButton").innerHTML = active ? `<span>◌</span> ${activeLabel}` : "<span>＋</span> Run local audit";
+    $("#sourceReviewButton").textContent = active ? activeLabel : sourceReviewEnabled ? "Review approved source" : "Enable source review";
+    $("#publicReviewButton").textContent = active ? activeLabel : !publicReviewEnabled ? "Enable public review" : data.scope.publicPages.length ? "Review approved pages" : "Configure approved pages";
+    $("#publicReviewDescription").textContent = data.scope.publicPages.length
+      ? "Configured page(s): " + data.scope.publicPages.join(", ") + ". One unauthenticated GET per page; no redirects, cookies, assets, or page links are followed. GET can trigger actions on some sites, so each run asks you to confirm these pages are safe to request."
+      : "No public pages are configured. Add exact HTTPS page URLs to publicReadOnlyPages in local scope.json and add passive-public-review to approvedServices, then restart the app.";
     if (active && !state.timer) state.timer = setInterval(refresh, 1600);
     if (!active && state.timer) { clearInterval(state.timer); state.timer = null; }
   } catch (error) {
@@ -179,8 +202,20 @@ async function showJob(id) {
 
 async function createJob(action) {
   try {
-    await api("/api/jobs", { method: "POST", body: JSON.stringify({ action }) });
-    showToast(action === "retest" ? "Retest queued against the selected secure profile" : "Local audit queued");
+    let confirmPublicGet = false;
+    if (action === "public-review") {
+      const pages = state.publicPages.map((page) => "• " + page).join("\n");
+      confirmPublicGet = window.confirm(
+        "RevenueGuard will send one unauthenticated GET to each page below:\n\n" + pages +
+        "\n\nSome GET URLs can trigger actions on a website. Confirm that you own or have permission to review these exact pages and that each page is safe to request. Continue?"
+      );
+      if (!confirmPublicGet) return;
+    }
+    await api("/api/jobs", { method: "POST", body: JSON.stringify({ action, confirmPublicGet }) });
+    showToast(action === "retest" ? "Retest queued against the selected secure profile"
+      : action === "source-review" ? "Source review queued"
+      : action === "public-review" ? "Public page review queued"
+      : "Local audit queued");
     await refresh();
   } catch (error) {
     showToast(error.message);
@@ -189,6 +224,8 @@ async function createJob(action) {
 
 $("#runAuditButton").addEventListener("click", () => createJob("audit"));
 $("#retestButton").addEventListener("click", () => createJob("retest"));
+$("#sourceReviewButton").addEventListener("click", () => createJob("source-review"));
+$("#publicReviewButton").addEventListener("click", () => createJob("public-review"));
 $("#refreshButton").addEventListener("click", refresh);
 $("#closeDialog").addEventListener("click", () => $("#detailDialog").close());
 $("#detailDialog").addEventListener("click", (event) => { if (event.target === $("#detailDialog")) $("#detailDialog").close(); });

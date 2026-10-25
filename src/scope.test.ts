@@ -4,16 +4,35 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mock, test } from "node:test";
 
-import { assertInScope, loadScopeConfig, scopedFetch } from "./scope.ts";
+import { assertInScope, assertPublicPageInScope, loadScopeConfig, scopedFetch } from "./scope.ts";
 import type { ScopeConfig } from "./scope.ts";
 
-function scope(overrides: Partial<ScopeConfig> = {}): ScopeConfig {
+function scope(overrides: Omit<Partial<ScopeConfig>, "budgets"> & { budgets?: Partial<ScopeConfig["budgets"]> } = {}): ScopeConfig {
   return {
     mode: "laboratory",
     approvedOrigins: ["http://127.0.0.1:8765"],
     approvedPathPrefixes: ["/lab/"],
-    budgets: { maxRequestsPerAudit: 32, maxConcurrentAudits: 1, timeoutMs: 2500 },
+    approvedServices: ["revenueguard-demo", "source-review", "passive-public-review"],
+    sourceDirectories: ["./src"],
+    testAccounts: [
+      { name: "alice", role: "user" },
+      { name: "bob", role: "user" },
+      { name: "admin", role: "admin" },
+    ],
+    approvedCallbacks: [],
+    publicReadOnlyPages: [],
+    resetProcedure: "POST /api/lab/profile resets synthetic state.",
     ...overrides,
+    budgets: {
+      maxRequestsPerAudit: 32,
+      maxConcurrentAudits: 1,
+      timeoutMs: 2500,
+      maxSourceFiles: 500,
+      maxSourceBytes: 2_000_000,
+      maxPublicPages: 4,
+      maxPublicBytesPerPage: 1_000_000,
+      ...overrides.budgets,
+    },
   };
 }
 
@@ -34,7 +53,15 @@ test("loads a strict laboratory scope and rejects public or malformed origins", 
     assert.equal(loaded.mode, "laboratory");
     assert.deepEqual(loaded.approvedOrigins, ["http://127.0.0.1:8765"]);
     assert.deepEqual(loaded.approvedPathPrefixes, ["/lab/"]);
+    assert.deepEqual(loaded.sourceDirectories, ["./src"]);
     assert.equal(loaded.budgets.maxRequestsPerAudit, 32);
+    assert.equal(loaded.budgets.maxSourceFiles, 500);
+  });
+  withScopeFile(scope({ approvedServices: ["revenueguard-demo"] }), (path) => {
+    assert.deepEqual(loadScopeConfig(path).approvedServices, ["revenueguard-demo"]);
+  });
+  withScopeFile(scope({ approvedServices: ["revenueguard-demo", "unknown-review"] }), (path) => {
+    assert.throws(() => loadScopeConfig(path), /approvedServices/i);
   });
 
   for (const origin of [
@@ -50,6 +77,56 @@ test("loads a strict laboratory scope and rejects public or malformed origins", 
   }
   withScopeFile(scope({ mode: "production" as "laboratory" }), (path) => {
     assert.throws(() => loadScopeConfig(path), /laboratory/i);
+  });
+
+  for (const sourceDirectory of ["../outside", "/", "./src/../../outside", "src\\..\\outside"]) {
+    withScopeFile(scope({ sourceDirectories: [sourceDirectory] }), (path) => {
+      assert.throws(() => loadScopeConfig(path), /sourceDirectories/i);
+    });
+  }
+  withScopeFile(scope({ sourceDirectories: ["/tmp/approved-project/src"] }), (path) => {
+    assert.deepEqual(loadScopeConfig(path).sourceDirectories, ["/tmp/approved-project/src"]);
+  });
+
+  withScopeFile(scope({ approvedCallbacks: ["https://example.com/callback"] }), (path) => {
+    assert.throws(() => loadScopeConfig(path), /callback integrations are not supported/i);
+  });
+  for (const page of ["http://nodbim.com/", "https://127.0.0.1/", "https://[2606:4700:4700::1111]/", "https://internal/", "https://nodbim.com:8443/", "https://nodbim.com/?token=secret", "https://user:pass@nodbim.com/"]) {
+    withScopeFile(scope({ publicReadOnlyPages: [page] }), (path) => {
+      assert.throws(() => loadScopeConfig(path), /publicReadOnlyPages/i);
+    });
+  }
+  withScopeFile(scope({ publicReadOnlyPages: ["https://nodbim.com/"] }), (path) => {
+    assert.deepEqual(loadScopeConfig(path).publicReadOnlyPages, ["https://nodbim.com/"]);
+  });
+
+  withScopeFile(scope({ budgets: { maxRequestsPerAudit: 32, maxConcurrentAudits: 2, timeoutMs: 2500, maxSourceFiles: 500, maxSourceBytes: 2_000_000 } }), (path) => {
+    assert.throws(() => loadScopeConfig(path), /maxConcurrentAudits/i);
+  });
+
+  const legacy: Record<string, unknown> = {
+    ...scope(),
+    approvedServices: ["revenueguard-demo"],
+    budgets: { maxRequestsPerAudit: 32, maxConcurrentAudits: 1, timeoutMs: 2500 },
+  };
+  delete legacy.publicReadOnlyPages;
+  withScopeFile(legacy, (path) => {
+    const loaded = loadScopeConfig(path);
+    assert.deepEqual(loaded.approvedServices, ["revenueguard-demo"]);
+    assert.equal(loaded.budgets.maxSourceFiles, 500);
+    assert.equal(loaded.budgets.maxSourceBytes, 2_000_000);
+    assert.deepEqual(loaded.publicReadOnlyPages, []);
+    assert.equal(loaded.budgets.maxPublicPages, 4);
+  });
+
+  const legacyWithSource: Record<string, unknown> = {
+    ...scope(),
+    approvedServices: ["revenueguard-demo", "source-review"],
+    budgets: { maxRequestsPerAudit: 32, maxConcurrentAudits: 1, timeoutMs: 2500 },
+  };
+  delete legacyWithSource.publicReadOnlyPages;
+  withScopeFile(legacyWithSource, (path) => {
+    assert.deepEqual(loadScopeConfig(path).approvedServices, ["revenueguard-demo", "source-review"]);
   });
 });
 
@@ -68,6 +145,14 @@ test("assertInScope permits exact configured loopback origins and approved paths
     "http://127.0.0.1:8765/lab/%2e%2e/api/session",
   ]) {
     assert.throws(() => assertInScope(url, config), /scope|origin|credential|port|protocol|path/i);
+  }
+});
+
+test("passive public scope requires an exact canonical configured page", () => {
+  const config = scope({ publicReadOnlyPages: ["https://nodbim.com/"] });
+  assert.equal(assertPublicPageInScope("https://nodbim.com/", config).href, "https://nodbim.com/");
+  for (const page of ["https://nodbim.com/about", "https://other.example/", "https://nodbim.com/?source=test"]) {
+    assert.throws(() => assertPublicPageInScope(page, config), /publicReadOnlyPages|scope/i);
   }
 });
 

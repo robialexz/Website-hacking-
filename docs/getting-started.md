@@ -1,65 +1,92 @@
-# Introducing RevenueGuard Lab v0.1.0: A Local Security Training Lab
+# Getting started
 
-I'm sharing RevenueGuard Lab v0.1.0, an early pre-release of a small security training lab that runs on your own machine.
+RevenueGuard Lab provides three separate workflows:
 
-The lab starts its own synthetic demo app and runs a fixed set of checks against it. You can switch between **Vulnerable examples** and **Secure controls**, inspect request and response evidence, and retest the same fixture. It is designed for learning how specific behaviors differ; it is not a general-purpose website scanner.
+- **Local security audit:** fixed, non-destructive checks against the bundled synthetic app at `127.0.0.1:8765`.
+- **Approved source review:** read-only pattern checks against explicitly listed JavaScript and TypeScript directories on disk.
+- **Public-page review:** bounded observations from one unauthenticated GET to each exact HTTPS page in local `scope.json`. GET requests can still trigger side effects on some sites, so this review is not guaranteed to be read-only.
 
-[View the repository](https://github.com/robialexz/revenueguard-lab) or [download the v0.1.0 pre-release](https://github.com/robialexz/revenueguard-lab/releases/tag/v0.1.0).
+The dynamic audit never targets public sites. The source review makes no network requests and does not execute project code. The public-page review does not perform vulnerability probes, crawl pages, follow redirects, or send credentials; a GET can still trigger an action on a site.
 
-## Quick start
+## Start the lab
 
-You'll need Node.js 26 or newer. The app has no third-party runtime dependencies, and running it does not require `npm install`, an API key, a database server, or an internet connection.
+Requirements: Node.js 26 or newer. There are no runtime packages to install.
 
 ```sh
 git clone https://github.com/robialexz/revenueguard-lab.git
 cd revenueguard-lab
-node --version   # confirm v26 or newer
 npm start
 ```
 
-Open [http://127.0.0.1:8765](http://127.0.0.1:8765) in your browser. On first start, the app copies `scope.example.json` to `scope.json` and creates `data/revenueguard.sqlite` for local run history.
+Open <http://127.0.0.1:8765>. The server listens on loopback only. If the browser cannot connect, check that your local environment permits loopback servers and that port 8765 is available.
 
-## Walk through vulnerable and secure profiles
+## Try the synthetic audit
 
-1. In **Demo profile**, choose **Vulnerable examples**.
-2. Select **Run local audit** and wait for the job to finish.
-3. In **Latest findings**, choose **View evidence** to inspect what the check sent and received, along with the expected behavior, observed behavior, impact, and suggested remediation.
+1. Leave **Demo profile** on **Vulnerable examples** and select **Run local audit**.
+2. Open a finding to review the expected behavior, observed response, evidence, and suggested remediation.
+3. Switch the profile to **Secure controls** and select **Retest findings**.
+4. Open a run report from **Recent audit runs** to view coverage and execution logs.
 
-The fixture contains seven deterministic checks. Six are designed to reproduce a confirmed behavior in the vulnerable profile:
+All records, roles, discount codes, dependency markers, and fake files belong to the disposable fixture. The reports describe that fixture only.
 
-- A synthetic user can read another synthetic user's record, and an unauthenticated request can reach the synthetic admin panel.
-- A fixed search canary returns more synthetic rows than an unmatched query. This is a filter-bypass demonstration, not SQL execution or a verified SQL injection.
-- A fixed SVG marker is returned as unescaped HTML. The audit records the response; it does not open a browser to execute the marker, and arbitrary query text is escaped.
-- A hard-coded marker for a fake private file is returned from an in-memory fixture. The check does not read a file from your computer.
-- The same synthetic one-use discount can be redeemed twice.
+## Review a local source project
 
-The seventh check displays the fictional `RG-DEMO-001` dependency marker as **suspected** for cautious triage. It is not a real advisory, and the app does not download advisory data.
+The generated `scope.json` enables only `revenueguard-demo`. To opt in to local source review, add `source-review` to `approvedServices`. The source directory list starts with:
 
-4. Change **Demo profile** to **Secure controls**.
-5. Select **Retest findings**.
+```json
+"sourceDirectories": ["./src"]
+```
 
-In the secure profile, the synthetic cross-user record request is denied, the admin route requires valid authorization, the search canary is treated literally, the HTML marker is escaped, the fake traversal is blocked, and a second use of the discount is rejected. The six confirmed fixture findings should no longer reproduce; the fictional dependency marker remains suspected.
+To review another project on the same machine, add the exact local source directory to that array. A relative path must remain inside the RevenueGuard project. An absolute path is accepted when it resolves to a directory inside a recognizable local project. The configured directory and each file are checked for symlinks; symlinked entries are skipped.
 
-A retest marks earlier confirmed findings as fixed only when every required check validates its expected safe behavior. A timeout, server error, missing route, or other unverified response is incomplete evidence, not proof of a fix. Even a complete secure-profile retest says something only about this bundled demo app.
+Restart RevenueGuard Lab after editing `scope.json` so the dashboard and queue reload the scope.
 
-## Reports stay local
+The scanner reads regular `.js`, `.jsx`, `.cjs`, `.mjs`, `.ts`, and `.tsx` files, up to the scope budgets. It skips generated, dependency, hidden, and build output folders. The default caps are 500 files and 2 MB total. If a cap stops the scan, the coverage report marks the result incomplete.
 
-Open a completed run from **Recent audit runs** to view its logs, or open its report. The lab provides technical, executive, and remediation report views; each includes a scope note and can be printed or saved as a PDF with **Print / Save as PDF**.
+Select **Review approved source**. The four current checks look for:
 
-Run history, findings, evidence, and logs are stored in the local SQLite database at `data/revenueguard.sqlite`. Reports are examples for learning. They are not evidence about a real website, customer impact, or lost revenue.
+- `eval()` and `new Function()` calls
+- disabled TLS certificate validation
+- credential-like literals assigned to secret-shaped names
+- non-literal values assigned to `innerHTML` or passed to `insertAdjacentHTML`
 
-## Safety boundary and current limits
+Every source match is **Suspected**. Findings include the relative file and line, a redacted code excerpt, a SHA-256 file hash, and a remediation suggestion. These pattern checks can miss issues and produce false positives; validate the surrounding code manually. The app does not patch source files.
 
-The server binds to `127.0.0.1:8765`, checks the request host and local socket, and the audit uses a fixed loopback origin and fixed fixture paths. The scope guard accepts literal loopback addresses and approved paths, disables redirects, and applies a request budget and timeout. Adding another origin to `scope.json` does not redirect the audit.
+## Review an approved public page
 
-All accounts, records, discounts, dependency data, and files are synthetic. The lab makes no external callbacks, real purchases, cloud AI calls, or live advisory lookups. It cannot target an arbitrary URL.
+The checked-in `scope.example.json` enables only `revenueguard-demo` and leaves `publicReadOnlyPages` empty. To opt in, add `passive-public-review` to `approvedServices` and one or more exact canonical HTTPS page URLs to the local `scope.json`, for example:
 
-This pre-release does not scan a real application, import another project, inspect its dependencies, or patch source code. It also does not test session invalidation, password reset, CSRF, CORS, SSRF, uploads, command execution, or race conditions. Please use it as a local learning environment, not to scan public websites or systems you do not own and have explicit permission to test.
+```json
+"publicReadOnlyPages": ["https://example.com/"]
+```
 
-## Feedback and contributions
+Do not include a query string, fragment, credentials, or a nondefault port. The default budget allows at most four pages and caps each HTML response at 1 MB. Restart the app after editing the scope.
 
-If you try the lab, I’d value specific feedback: which check was easiest or hardest to understand, whether the evidence and reports explain the result clearly, and what would make the local walkthrough more useful. Bug reports and contribution proposals are welcome; please read [CONTRIBUTING.md](https://github.com/robialexz/revenueguard-lab/blob/main/CONTRIBUTING.md) and [SECURITY.md](https://github.com/robialexz/revenueguard-lab/blob/main/SECURITY.md) first.
+Select **Review approved pages** to make one direct, unauthenticated GET per listed page. The request sends no cookies, authorization, or referrer; it does not follow redirects, fetch assets, parse links for follow-up, submit forms, or retry. DNS answers must all be public addresses, and the connection is pinned to a checked address with TLS verification enabled.
 
-One project-status note: the repository currently has **no software license**. It is public so people can review it, but public visibility does not grant permission to reuse or redistribute the code. I’m not presenting it as open-source software while that remains unresolved.
+Before every run, the app displays the exact page list and asks you to confirm that you own or have permission to review it and that each URL is safe to request. Some sites attach actions to GET routes, so do not include tokenized or state-changing URLs. The app cannot guarantee that a GET is side-effect-free.
 
-Thanks for taking a look at this early preview.
+Each report lists the exact pages captured with the job's scope. It stores response status, timing/byte measurements, selected security-header values, and page metadata counts, but not the HTML body or arbitrary response headers. Results are **Suspected** observations about response headers, basic search metadata, or image alt attributes. They are not an active security assessment, a ranking prediction, or a revenue estimate.
+
+## Scope settings
+
+`scope.json` is local and excluded from source control. Its fields describe the exact enabled capabilities:
+
+- `approvedOrigins` and `approvedPathPrefixes` remain literal loopback scope for the synthetic app.
+- `approvedServices` starts with only the synthetic demo. Add `source-review` or `passive-public-review` only when you intend to enable those separate capabilities.
+- `sourceDirectories` is the source-file allowlist.
+- `testAccounts` names only the synthetic fixture identities.
+- `approvedCallbacks` must stay empty in this release.
+- `publicReadOnlyPages` is the exact HTTPS page allowlist for public-page review; the field name does not guarantee a GET has no side effects.
+- `budgets` limits requests, worker concurrency, source files/bytes, public pages/response bytes, and timeouts.
+- `resetProcedure` describes the supported synthetic profile reset.
+
+Older generated scope files preserve their existing `approvedServices` list and get safe in-memory defaults for newer budgets and an empty `publicReadOnlyPages` list. Existing origins, paths, and source directories are preserved. Interrupted jobs are marked failed after restart and are not replayed automatically. Restart the app after editing this file.
+
+## Verify changes
+
+```sh
+npm test
+```
+
+The tests use in-process synthetic fixtures and mocked transports. They do not start the HTTP server or contact external targets.

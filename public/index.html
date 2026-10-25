@@ -20,10 +20,12 @@
         <a class="nav-item active" href="#overview"><span class="nav-icon">▦</span> Overview</a>
         <a class="nav-item" href="#findings"><span class="nav-icon">⌕</span> Findings <span class="nav-count" id="sideFindingCount">0</span></a>
         <a class="nav-item" href="#jobs"><span class="nav-icon">◷</span> Audit runs</a>
+        <a class="nav-item" href="#source-review"><span class="nav-icon">⌘</span> Source review</a>
+        <a class="nav-item" href="#passive-review"><span class="nav-icon">↗</span> Public review</a>
         <a class="nav-item" href="#scope"><span class="nav-icon">◎</span> Scope & safety</a>
       </nav>
       <div class="sidebar-bottom">
-        <div class="lab-status"><span class="status-dot"></span><div><b>Local lab only</b><small>No outbound internet</small></div></div>
+        <div class="lab-status"><span class="status-dot"></span><div><b>Loopback lab</b><small>Public review is opt-in</small></div></div>
         <p>RevenueGuard Lab<br>Offline security validation</p>
       </div>
     </aside>
@@ -36,23 +38,33 @@
 
       <section class="page" id="overview">
         <div class="page-heading">
-          <div><p class="eyebrow">SECURITY VALIDATION</p><h1>Lab overview</h1><p class="subheading">Run reproducible checks against the synthetic demo app. All requests stay on this machine.</p></div>
+          <div><p class="eyebrow">SECURITY VALIDATION</p><h1>Lab overview</h1><p class="subheading">Run dynamic checks on the synthetic app, review approved local source, or request one bounded GET to each explicitly listed public page. A GET may trigger site actions, so the app asks you to confirm each run.</p></div>
           <div class="heading-actions"><label class="profile-control">Demo profile <select id="profileSelect"><option value="vulnerable">Vulnerable examples</option><option value="secure">Secure controls</option></select></label><button class="button button-secondary" id="retestButton" disabled>Retest findings</button><button class="button button-primary" id="runAuditButton"><span>＋</span> Run local audit</button></div>
         </div>
 
-        <div class="notice" role="note"><span class="notice-icon">i</span><span><b>Isolated demonstration.</b> The demo uses synthetic records and an in-memory fake file. It cannot target public websites or read real files.</span><a href="#scope">Review scope</a></div>
+        <div class="notice" role="note"><span class="notice-icon">i</span><span><b>Separate scopes.</b> Active checks stay on the synthetic loopback app. Source review reads only approved local code. Public review makes one unauthenticated GET per exact HTTPS page and does not follow redirects, forms, assets, or links. Some sites attach actions to GET routes, so confirm that each listed page is safe to request.</span><a href="#scope">Review scope</a></div>
+
+        <section class="panel source-review-panel" id="source-review">
+          <div><p class="eyebrow">READ-ONLY CODE CHECKS</p><h2>Review approved source</h2><p>Inspect the local folders in scope.json for a small set of risky code patterns. Results are leads for manual validation, not proof of exploitability.</p></div>
+          <button class="button button-secondary" id="sourceReviewButton">Review approved source</button>
+        </section>
+
+        <section class="panel source-review-panel passive-review-panel" id="passive-review">
+          <div><p class="eyebrow">PUBLIC PAGE OBSERVATIONS · OPT IN</p><h2>Review approved public pages</h2><p id="publicReviewDescription">Loading the exact HTTPS page list from scope.json.</p></div>
+          <button class="button button-secondary" id="publicReviewButton" disabled>Configure approved pages</button>
+        </section>
 
         <div class="metric-grid" aria-label="Audit summary">
           <article class="metric-card"><div class="metric-top"><span>Confirmed findings</span><span class="metric-icon red">!</span></div><strong id="confirmedCount">—</strong><small>Reproduced with local evidence</small></article>
           <article class="metric-card"><div class="metric-top"><span>Suspected</span><span class="metric-icon amber">?</span></div><strong id="suspectedCount">—</strong><small>Needs manual validation</small></article>
           <article class="metric-card"><div class="metric-top"><span>Audit runs</span><span class="metric-icon blue">◷</span></div><strong id="jobCount">—</strong><small>Persisted in local SQLite</small></article>
-          <article class="metric-card"><div class="metric-top"><span>Coverage checks</span><span class="metric-icon green">✓</span></div><strong id="coverageCount">—</strong><small>In-scope demo checks attempted</small></article>
+          <article class="metric-card"><div class="metric-top"><span>Coverage checks</span><span class="metric-icon green">✓</span></div><strong id="coverageCount">—</strong><small>From the latest completed run</small></article>
         </div>
 
         <div class="section-grid">
           <section class="panel findings-panel" id="findings">
             <div class="panel-heading"><div><p class="eyebrow">EVIDENCE-BASED</p><h2>Latest findings</h2></div><span id="findingsTotal" class="muted-label">0 total</span></div>
-            <div class="table-wrap"><table><thead><tr><th>Finding</th><th>Severity</th><th>Status</th><th>Confidence</th><th></th></tr></thead><tbody id="findingsBody"><tr><td colspan="5" class="empty">No findings yet. Run the local audit to inspect the demo app.</td></tr></tbody></table></div>
+            <div class="table-wrap"><table><thead><tr><th>Finding</th><th>Severity</th><th>Status</th><th>Confidence</th><th></th></tr></thead><tbody id="findingsBody"><tr><td colspan="5" class="empty">No findings yet. Run a local audit or an approved source or public page review.</td></tr></tbody></table></div>
           </section>
           <section class="panel jobs-panel" id="jobs">
             <div class="panel-heading"><div><p class="eyebrow">EXECUTION HISTORY</p><h2>Recent audit runs</h2></div><span class="muted-label">Local queue</span></div>
@@ -65,12 +77,16 @@
           <div class="scope-grid">
             <div><small>APPROVED ORIGIN</small><b id="scopeOrigin">Loading…</b><p>Requests are limited to the local demo service.</p></div>
             <div><small>APPROVED PATHS</small><b id="scopePaths">Loading…</b><p>Only the registered fixture API is tested.</p></div>
+            <div><small>APPROVED SOURCE</small><b id="scopeSources">Loading…</b><p id="scopeSourceBudget">Read-only file inspection; symlinks and generated folders are skipped.</p></div>
+            <div><small>PUBLIC PAGES</small><b id="scopePublicPages">Loading…</b><p id="scopePublicBudget">One GET per listed page; no crawling, credentials, redirects, or form submits.</p></div>
             <div><small>REQUEST BUDGET</small><b id="scopeBudget">Loading…</b><p>One audit at a time, with a fixed timeout.</p></div>
-            <div><small>TEST DATA</small><b>Synthetic users and records</b><p>No real credentials or customer data.</p></div>
+            <div><small>TEST ACCOUNTS</small><b id="scopeAccounts">Loading…</b><p>Synthetic identities only.</p></div>
+            <div><small>APPROVED SERVICES</small><b id="scopeServices">Loading…</b><p>No callback integrations are enabled.</p></div>
+            <div><small>RESET PROCEDURE</small><b id="scopeReset">Loading…</b><p>Applies to the disposable synthetic demo state.</p></div>
           </div>
         </section>
 
-        <footer class="footer"><span>RevenueGuard Lab <span id="appVersion"></span></span><span>Local-first · no cloud calls · no external target discovery</span></footer>
+        <footer class="footer"><span>RevenueGuard Lab <span id="appVersion"></span></span><span>Local-first · no cloud calls · no crawling or target discovery</span></footer>
       </section>
     </main>
   </div>
