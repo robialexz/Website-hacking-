@@ -2,7 +2,7 @@
 
 > An offline-first, loopback-only security training lab for exploring common web flaws with a disposable synthetic app. Compare vulnerable examples with secure controls, review evidence, and generate reports without scanning real websites.
 
-![RevenueGuard Lab overview illustration](assets/social-preview.jpg)
+![RevenueGuard Lab overview illustration](revenueguard-lab-social-preview.jpg)
 
 RevenueGuard Lab is a small, dependency-free learning project. Its dashboard runs on your own machine and audits only the demo service included in this repository. It is **not** a general-purpose website scanner, and its findings describe the synthetic fixture only.
 
