@@ -1,0 +1,27 @@
+{
+  "mode": "laboratory",
+  "approvedOrigins": [
+    "http://127.0.0.1:8765"
+  ],
+  "approvedPathPrefixes": [
+    "/lab/"
+  ],
+  "approvedServices": [
+    "revenueguard-demo"
+  ],
+  "sourceDirectories": [
+    "./src"
+  ],
+  "testAccounts": [
+    { "name": "alice", "role": "user" },
+    { "name": "bob", "role": "user" },
+    { "name": "admin", "role": "admin" }
+  ],
+  "approvedCallbacks": [],
+  "budgets": {
+    "maxRequestsPerAudit": 32,
+    "maxConcurrentAudits": 1,
+    "timeoutMs": 2500
+  },
+  "resetProcedure": "POST /api/lab/profile with {\"profile\":\"vulnerable\"} or {\"profile\":\"secure\"} resets synthetic state. No real data is used."
+}
