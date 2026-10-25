@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>RevenueGuard Lab</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" type="module"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Main navigation">
+      <a class="brand" href="/" aria-label="RevenueGuard Lab home">
+        <span class="brand-mark">R</span>
+        <span><strong>RevenueGuard</strong><small>LAB ENVIRONMENT</small></span>
+      </a>
+      <div class="side-label">WORKSPACE</div>
+      <nav>
+        <a class="nav-item active" href="#overview"><span class="nav-icon">▦</span> Overview</a>
+        <a class="nav-item" href="#findings"><span class="nav-icon">⌕</span> Findings <span class="nav-count" id="sideFindingCount">0</span></a>
+        <a class="nav-item" href="#jobs"><span class="nav-icon">◷</span> Audit runs</a>
+        <a class="nav-item" href="#scope"><span class="nav-icon">◎</span> Scope & safety</a>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="lab-status"><span class="status-dot"></span><div><b>Local lab only</b><small>No outbound internet</small></div></div>
+        <p>RevenueGuard Lab<br>Offline security validation</p>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="crumb"><span>Workspace</span><span class="crumb-sep">/</span><b>Overview</b></div>
+        <div class="top-actions"><span class="environment-pill"><span></span> LOOPBACK LAB</span><button class="icon-button" id="refreshButton" aria-label="Refresh dashboard" title="Refresh">↻</button></div>
+      </header>
+
+      <section class="page" id="overview">
+        <div class="page-heading">
+          <div><p class="eyebrow">SECURITY VALIDATION</p><h1>Lab overview</h1><p class="subheading">Run reproducible checks against the synthetic demo app. All requests stay on this machine.</p></div>
+          <div class="heading-actions"><label class="profile-control">Demo profile <select id="profileSelect"><option value="vulnerable">Vulnerable examples</option><option value="secure">Secure controls</option></select></label><button class="button button-secondary" id="retestButton" disabled>Retest findings</button><button class="button button-primary" id="runAuditButton"><span>＋</span> Run local audit</button></div>
+        </div>
+
+        <div class="notice" role="note"><span class="notice-icon">i</span><span><b>Isolated demonstration.</b> The demo uses synthetic records and an in-memory fake file. It cannot target public websites or read real files.</span><a href="#scope">Review scope</a></div>
+
+        <div class="metric-grid" aria-label="Audit summary">
+          <article class="metric-card"><div class="metric-top"><span>Confirmed findings</span><span class="metric-icon red">!</span></div><strong id="confirmedCount">—</strong><small>Reproduced with local evidence</small></article>
+          <article class="metric-card"><div class="metric-top"><span>Suspected</span><span class="metric-icon amber">?</span></div><strong id="suspectedCount">—</strong><small>Needs manual validation</small></article>
+          <article class="metric-card"><div class="metric-top"><span>Audit runs</span><span class="metric-icon blue">◷</span></div><strong id="jobCount">—</strong><small>Persisted in local SQLite</small></article>
+          <article class="metric-card"><div class="metric-top"><span>Coverage checks</span><span class="metric-icon green">✓</span></div><strong id="coverageCount">—</strong><small>In-scope demo checks attempted</small></article>
+        </div>
+
+        <div class="section-grid">
+          <section class="panel findings-panel" id="findings">
+            <div class="panel-heading"><div><p class="eyebrow">EVIDENCE-BASED</p><h2>Latest findings</h2></div><span id="findingsTotal" class="muted-label">0 total</span></div>
+            <div class="table-wrap"><table><thead><tr><th>Finding</th><th>Severity</th><th>Status</th><th>Confidence</th><th></th></tr></thead><tbody id="findingsBody"><tr><td colspan="5" class="empty">No findings yet. Run the local audit to inspect the demo app.</td></tr></tbody></table></div>
+          </section>
+          <section class="panel jobs-panel" id="jobs">
+            <div class="panel-heading"><div><p class="eyebrow">EXECUTION HISTORY</p><h2>Recent audit runs</h2></div><span class="muted-label">Local queue</span></div>
+            <div id="jobsList" class="jobs-list"><div class="empty">No audit runs yet.</div></div>
+          </section>
+        </div>
+
+        <section class="panel scope-panel" id="scope">
+          <div class="panel-heading"><div><p class="eyebrow">GUARDRAILS</p><h2>Active laboratory scope</h2></div><span class="scope-badge"><span class="status-dot"></span> ENFORCED</span></div>
+          <div class="scope-grid">
+            <div><small>APPROVED ORIGIN</small><b id="scopeOrigin">Loading…</b><p>Requests are limited to the local demo service.</p></div>
+            <div><small>APPROVED PATHS</small><b id="scopePaths">Loading…</b><p>Only the registered fixture API is tested.</p></div>
+            <div><small>REQUEST BUDGET</small><b id="scopeBudget">Loading…</b><p>One audit at a time, with a fixed timeout.</p></div>
+            <div><small>TEST DATA</small><b>Synthetic users and records</b><p>No real credentials or customer data.</p></div>
+          </div>
+        </section>
+
+        <footer class="footer"><span>RevenueGuard Lab <span id="appVersion"></span></span><span>Local-first · no cloud calls · no external target discovery</span></footer>
+      </section>
+    </main>
+  </div>
+  <dialog id="detailDialog" class="detail-dialog"><div class="dialog-head"><div><p class="eyebrow">FINDING DETAILS</p><h2 id="detailTitle">Finding</h2></div><button class="icon-button" id="closeDialog" aria-label="Close details">×</button></div><div id="detailContent"></div></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
