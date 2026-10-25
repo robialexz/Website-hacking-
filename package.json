@@ -1,0 +1,14 @@
+{
+  "name": "revenueguard-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Offline-first, loopback-only web security validation lab",
+  "scripts": {
+    "start": "node src/server.ts",
+    "test": "node --test src/*.test.ts"
+  },
+  "engines": {
+    "node": ">=26.0.0"
+  }
+}
