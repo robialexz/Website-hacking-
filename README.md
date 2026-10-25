@@ -91,6 +91,11 @@ public/                Dashboard and printable report UI
 scope.example.json     Safe local scope template copied on first start
 ```
 
+## Guides
+
+- [Getting started and vulnerable-versus-secure walkthrough](docs/getting-started.md)
+- [Demo recording storyboard and privacy checklist](docs/demo-video-script.md)
+
 ## Current limitations
 
 This first release audits only its own demo service. It does not import a third-party project, accept an arbitrary target URL, inspect real dependencies, patch arbitrary source code, or test session invalidation, password reset, CSRF, CORS, SSRF, uploads, command execution, or race conditions. A future feature that changes the target boundary needs a separate design and an explicitly authorized isolated environment.
