@@ -396,6 +396,31 @@ export async function scopedFetch(
   }
   requestCounts.set(config, count + 1);
 
+  return fetchApprovedTarget(targetUrl, config, init);
+}
+
+/** Create an isolated request budget for one audit run. */
+export function createScopedFetch(config: ScopeConfig): typeof scopedFetch {
+  let requestCount = 0;
+  return async (value, suppliedConfig, init = {}) => {
+    if (suppliedConfig !== config) {
+      fail("Scoped fetch configuration changed during an audit");
+    }
+    const targetUrl = assertInScope(value, config);
+    if (requestCount >= config.budgets.maxRequestsPerAudit) {
+      fail("Scope request budget exhausted");
+    }
+    requestCount += 1;
+    return fetchApprovedTarget(targetUrl, config, init);
+  };
+}
+
+async function fetchApprovedTarget(
+  targetUrl: URL,
+  config: ScopeConfig,
+  init: RequestInit,
+): Promise<ScopedFetchResponse> {
+
   if (init.redirect === "follow") {
     fail("Network redirects are disabled by scopedFetch");
   }
