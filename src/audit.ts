@@ -1,4 +1,4 @@
-import { scopedFetch } from "./scope.ts";
+import { createScopedFetch } from "./scope.ts";
 import type { ScopeConfig, ScopedFetchResponse } from "./scope.ts";
 
 export type FindingStatus = "CONFIRMED" | "SUSPECTED" | "NOT REPRODUCED" | "NOT TESTED";
@@ -140,7 +140,7 @@ function makeFinding(input: Omit<AuditFinding, "target" | "retestStatus">, targe
  */
 export async function executeAudit(options: AuditOptions): Promise<AuditResult> {
   const { scope } = options;
-  const transport = options.transport ?? scopedFetch;
+  const transport = options.transport ?? createScopedFetch(scope);
   if (!scope.approvedOrigins.includes(DEMO_ORIGIN)) {
     throw new Error(`Scope config must explicitly approve the fixed demo origin ${DEMO_ORIGIN}`);
   }
