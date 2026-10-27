@@ -54,7 +54,7 @@ See [Getting started](docs/getting-started.md) for configuration and workflow de
 
 ## Local data and privacy
 
-Run history is stored in `data/revenueguard.sqlite`. For web scans, the full starting URL is held in process memory only while that run is queued or active; local history stores the origin and aggregate observations, while reports omit route paths. Startup removes paths saved by older web-scan builds. Other configured exact-page workflows retain their configured URLs. HTML response bodies, cookie names, and cookie values are not retained.
+Run history is stored in `data/revenueguard.sqlite`. For web scans, the full starting URL is held in process memory only while that run is queued or active; local history stores the origin and aggregate observations, while findings and reports omit route paths. Response-header values are reduced to safe labels before storage. Startup removes paths saved by older web-scan builds from active records; it does not erase backups or guarantee forensic removal from old SQLite journal/free-page copies. Other configured exact-page workflows may retain their URLs in job history. Web-scan HTML response bodies, cookie names, and cookie values are not retained.
 
 There is no automatic expiry or per-run deletion screen. Stop RevenueGuard and remove `data/revenueguard.sqlite` to clear local run history. Remove sensitive configured URLs separately from `scope.json`.
 

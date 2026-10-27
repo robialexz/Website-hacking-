@@ -30,6 +30,9 @@ const MAX_LINKS_PER_PAGE = 1000;
 const MAX_FRONTIER = 5000;
 const MAX_FINDINGS = 1000;
 const MAX_COVERAGE = 10000;
+const REPORTABLE_MEDIA_TYPES = new Set([
+  "text/html", "application/xhtml+xml", "text/plain", "application/json", "application/xml", "application/octet-stream",
+]);
 const STATEFUL_PATH_SEGMENT = /(?:^|[-_.])(?:logout|log-out|signout|sign-out|unsubscribe|delete|destroy|remove|deactivate|disable|confirm|confirmation|activate|activation|reset|password-reset|reset-password|forgot-password|purchase|checkout|payment|transfer|withdraw|subscribe|verify|verification|verify-email|email-verification|callback|accept|accept-invite|redeem|consume|claim|login|magic-link|invitation|revoke|cancel)(?:$|[-_.])/i;
 const SENSITIVE_PATH_SEGMENT = /^(?:token|key|secret|code|invite|session|auth|reset|verify|confirmation|unsubscribe)$/i;
 const TOKEN_LIKE_PATH_SEGMENT = /^(?:\d{6,}|[a-f\d]{16,}|(?=.*[a-z])(?=.*\d)[a-z\d_-]{4,}|[a-z\d_-]{32,}|[a-z]{16,31})$/i;
@@ -100,8 +103,20 @@ function safeHtmlPageUrl(value: string, base: URL, origin: string): URL | undefi
   return url;
 }
 
+function normalizedMediaType(response: PublicPageResponse): string {
+  const value = response.headers.get("content-type");
+  if (value === null) return "unknown";
+  const media = value.split(";", 1)[0].trim().toLowerCase();
+  return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(media) ? media : "other";
+}
+
+function reportMediaType(response: PublicPageResponse): string {
+  const media = normalizedMediaType(response);
+  return media === "unknown" || REPORTABLE_MEDIA_TYPES.has(media) ? media : "other";
+}
+
 function isHtml(response: PublicPageResponse): boolean {
-  const media = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+  const media = normalizedMediaType(response);
   return media === "text/html" || media === "application/xhtml+xml";
 }
 
@@ -536,7 +551,7 @@ export async function executeWebScan(options: WebScanOptions): Promise<AuditResu
 
     responseBytes += response.bytes;
     if (response.tlsCertificateValidation === "validated") tlsValidatedResponses += 1;
-    const media = response.headers.get("content-type")?.split(";", 1)[0].trim().slice(0, 80) || "unknown";
+    const media = reportMediaType(response);
     addCoverage(context, {
       key: "web.fetch." + suffix, label: "Fetch " + safeUrl(current.url), attempted: true,
       requestStatus: "response-received",

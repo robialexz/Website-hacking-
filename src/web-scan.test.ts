@@ -120,6 +120,21 @@ test("crawls bounded same-origin links and records path-free passive observation
   assert.match(crawl?.details || "", /action-like/);
 });
 
+test("coverage stores only allowlisted media type labels from Content-Type", async () => {
+  const marker = "private-session-route-7f2a91";
+  const result = await executeWebScan({
+    scope: scannerScope(),
+    target: "https://example.com/",
+    maxPages: 1,
+    maxDepth: 0,
+    transport: async () => response("<h1>Fixture</h1>", { "content-type": `application/${marker}` }),
+  });
+
+  const fetchCoverage = result.coverage.find((item) => item.key === "web.fetch.page-1");
+  assert.match(fetchCoverage?.details || "", /; other;/);
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(marker));
+});
+
 test("honors page and depth budgets and never fetches excluded links", async () => {
   const visited: string[] = [];
   const result = await executeWebScan({
