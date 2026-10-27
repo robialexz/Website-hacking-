@@ -18,6 +18,7 @@ export interface ScopeConfig {
     readonly timeoutMs: number;
     readonly maxSourceFiles: number;
     readonly maxSourceBytes: number;
+    readonly maxResponseBytes?: number;
     readonly maxPublicPages: number;
     readonly maxPublicBytesPerPage: number;
   };
@@ -272,21 +273,24 @@ function validateScopeConfig(value: unknown): asserts value is ScopeConfig {
   }
 
   const budgets = asRecord(config.budgets, "budgets");
-  const { maxRequestsPerAudit, maxConcurrentAudits, timeoutMs, maxSourceFiles, maxSourceBytes, maxPublicPages, maxPublicBytesPerPage } = budgets;
+  const { maxRequestsPerAudit, maxConcurrentAudits, timeoutMs, maxSourceFiles, maxSourceBytes, maxResponseBytes, maxPublicPages, maxPublicBytesPerPage } = budgets;
   if (!Number.isInteger(maxRequestsPerAudit) || (maxRequestsPerAudit as number) < 0) {
     fail("budgets.maxRequestsPerAudit must be a non-negative integer");
   }
   if (maxConcurrentAudits !== 1) {
     fail("budgets.maxConcurrentAudits must be 1; only one audit worker is supported");
   }
-  if (!Number.isInteger(timeoutMs) || (timeoutMs as number) < 1) {
-    fail("budgets.timeoutMs must be a positive integer");
+  if (!Number.isInteger(timeoutMs) || (timeoutMs as number) < 1 || (timeoutMs as number) > 30_000) {
+    fail("budgets.timeoutMs must be an integer from 1 to 30000");
   }
   if (!Number.isInteger(maxSourceFiles) || (maxSourceFiles as number) < 1 || (maxSourceFiles as number) > 5000) {
     fail("budgets.maxSourceFiles must be an integer from 1 to 5000");
   }
   if (!Number.isInteger(maxSourceBytes) || (maxSourceBytes as number) < 1024 || (maxSourceBytes as number) > 20_000_000) {
     fail("budgets.maxSourceBytes must be an integer from 1024 to 20000000");
+  }
+  if (maxResponseBytes !== undefined && (!Number.isInteger(maxResponseBytes) || (maxResponseBytes as number) < 1024 || (maxResponseBytes as number) > 20_000_000)) {
+    fail("budgets.maxResponseBytes must be an integer from 1024 to 20000000");
   }
   if (!Number.isInteger(maxPublicPages) || (maxPublicPages as number) < 1 || (maxPublicPages as number) > 8) {
     fail("budgets.maxPublicPages must be an integer from 1 to 8");
@@ -312,6 +316,7 @@ function migrateScopeConfig(value: unknown): unknown {
       ...budgets,
       maxSourceFiles: budgets.maxSourceFiles ?? 500,
       maxSourceBytes: budgets.maxSourceBytes ?? 2_000_000,
+      maxResponseBytes: budgets.maxResponseBytes ?? 2_000_000,
       maxPublicPages: budgets.maxPublicPages ?? 4,
       maxPublicBytesPerPage: budgets.maxPublicBytesPerPage ?? 1_000_000,
     };
@@ -351,6 +356,7 @@ export function loadScopeConfig(configPath: string): ScopeConfig {
       timeoutMs: parsed.budgets.timeoutMs,
       maxSourceFiles: parsed.budgets.maxSourceFiles,
       maxSourceBytes: parsed.budgets.maxSourceBytes,
+      maxResponseBytes: parsed.budgets.maxResponseBytes,
       maxPublicPages: parsed.budgets.maxPublicPages,
       maxPublicBytesPerPage: parsed.budgets.maxPublicBytesPerPage,
     }),
@@ -447,7 +453,7 @@ async function fetchApprovedTarget(
       fail("Network redirects are disabled by scopedFetch");
     }
 
-    const text = await response.text();
+    const text = await readResponseText(response, config.budgets.maxResponseBytes ?? 2_000_000);
     return {
       status: response.status,
       headers: response.headers,
@@ -459,4 +465,37 @@ async function fetchApprovedTarget(
     }
     throw error;
   }
+}
+
+async function readResponseText(response: Response, maxBytes: number): Promise<string> {
+  const body = response.body;
+  if (!body) return "";
+
+  const contentLength = Number(response.headers.get("content-length") || 0);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    await body.cancel().catch(() => undefined);
+    throw new Error("In-scope response exceeded the configured response byte limit.");
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error("In-scope response exceeded the configured response byte limit.");
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  }
+
+  const bodyBytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), bytes);
+  return bodyBytes.toString("utf8");
 }

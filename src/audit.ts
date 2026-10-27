@@ -1,7 +1,8 @@
 import { createScopedFetch } from "./scope.ts";
 import type { ScopeConfig, ScopedFetchResponse } from "./scope.ts";
 
-export type FindingStatus = "CONFIRMED" | "SUSPECTED" | "NOT REPRODUCED" | "NOT TESTED";
+export type FindingStatus = "CONFIRMED" | "SUSPECTED" | "NOT REPRODUCED" | "NOT TESTED" | "OBSERVED";
+export type RequestStatus = "not-sent" | "unknown" | "response-received";
 export type Severity = "Critical" | "High" | "Medium" | "Low" | "Info";
 
 export interface AuditEvidence {
@@ -37,8 +38,9 @@ export interface CoverageItem {
   key: string;
   label: string;
   attempted: boolean;
-  status: "CONFIRMED" | "SUSPECTED" | "NOT REPRODUCED" | "NOT TESTED";
+  status: "CONFIRMED" | "SUSPECTED" | "NOT REPRODUCED" | "NOT TESTED" | "OBSERVED" | "INCONCLUSIVE";
   controlVerified: boolean;
+  requestStatus?: RequestStatus;
   details?: string;
   error?: string;
 }
@@ -148,6 +150,8 @@ export async function executeAudit(options: AuditOptions): Promise<AuditResult> 
   const targetLabel = options.targetLabel ?? "RevenueGuard synthetic demo";
   const findings: AuditFinding[] = [];
   const coverage: CoverageItem[] = [];
+  let checkTransportInvoked = false;
+  let checkResponseReceived = false;
 
   async function request(
     path: string,
@@ -156,12 +160,14 @@ export async function executeAudit(options: AuditOptions): Promise<AuditResult> 
     body?: string,
   ): Promise<{ response: ScopedFetchResponse; url: URL }> {
     const url = new URL(path, origin);
+    checkTransportInvoked = true;
     const response = await transport(url, scope, {
       method,
       headers,
       ...(body ? { body } : {}),
       redirect: "manual",
     });
+    checkResponseReceived = true;
     if (response.status >= 500) throw new Error(`In-scope demo target returned HTTP ${response.status}`);
     return { response, url };
   }
@@ -171,6 +177,8 @@ export async function executeAudit(options: AuditOptions): Promise<AuditResult> 
     label: string,
     check: () => Promise<CheckOutput>,
   ): Promise<void> {
+    checkTransportInvoked = false;
+    checkResponseReceived = false;
     try {
       const output = await check();
       if (output.finding) findings.push(output.finding);
@@ -178,14 +186,18 @@ export async function executeAudit(options: AuditOptions): Promise<AuditResult> 
         key,
         label,
         attempted: true,
-        status: output.finding?.status === "CONFIRMED"
+        requestStatus: "response-received",
+        status: !output.verified ? "NOT TESTED" : output.finding?.status === "CONFIRMED"
           ? "CONFIRMED"
           : output.finding?.status === "SUSPECTED" ? "SUSPECTED" : "NOT REPRODUCED",
         controlVerified: output.verified,
         ...(!output.verified ? { error: output.error ?? "Expected demo response or control did not validate." } : {}),
       });
     } catch (error) {
-      coverage.push({ key, label, attempted: true, status: "NOT REPRODUCED", controlVerified: false, error: errorText(error) });
+      const requestStatus = checkResponseReceived
+        ? "response-received"
+        : checkTransportInvoked ? "unknown" : "not-sent";
+      coverage.push({ key, label, attempted: true, requestStatus, status: "NOT TESTED", controlVerified: false, error: errorText(error) });
     }
   }
 

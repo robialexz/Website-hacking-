@@ -1,6 +1,7 @@
 import { lookup as dnsLookup } from "node:dns/promises";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { performance } from "node:perf_hooks";
 
 import type { AuditEvidence, AuditFinding, AuditResult, CoverageItem, Severity } from "./audit.ts";
 import { assertPublicPageInScope } from "./scope.ts";
@@ -12,8 +13,18 @@ export interface PublicPageResponse {
   readonly status: number;
   readonly headers: Headers;
   readonly body: string;
+  readonly bodyStatus?: "complete" | "unavailable";
   readonly bytes: number;
   readonly elapsedMs: number;
+  /** Present only when the HTTPS transport completed certificate and hostname validation. */
+  readonly tlsCertificateValidation?: "validated";
+  /** Counts only; cookie names and values are never returned. */
+  readonly cookieFlagCounts?: {
+    readonly setCookieCount: number;
+    readonly secureCount: number;
+    readonly httpOnlyCount: number;
+    readonly sameSiteCount: number;
+  };
 }
 
 export type PublicPageTransport = (url: URL, scope: ScopeConfig) => Promise<PublicPageResponse>;
@@ -114,13 +125,33 @@ function safeHeadersFromResponse(headers: Record<string, string | string[] | und
   return safe;
 }
 
-function contentType(headers: Headers): string {
-  return headers.get("content-type") || "unknown";
+function summarizeCookieFlags(value: string | string[] | undefined): NonNullable<PublicPageResponse["cookieFlagCounts"]> {
+  const cookies = typeof value === "string" ? [value] : Array.isArray(value) ? value : [];
+  const attributeNames = (cookie: string): Set<string> => new Set(
+    cookie.split(";").slice(1).map((part) => part.trim().split("=", 1)[0].trim().toLowerCase()),
+  );
+  let secureCount = 0;
+  let httpOnlyCount = 0;
+  let sameSiteCount = 0;
+  for (const cookie of cookies) {
+    const attributes = attributeNames(cookie);
+    if (attributes.has("secure")) secureCount += 1;
+    if (attributes.has("httponly")) httpOnlyCount += 1;
+    if (attributes.has("samesite")) sameSiteCount += 1;
+  }
+  return { setCookieCount: cookies.length, secureCount, httpOnlyCount, sameSiteCount };
+}
+
+function mediaType(headers: Headers): string {
+  const value = headers.get("content-type");
+  if (value === null) return "unknown";
+  const type = value.split(";", 1)[0].trim().toLowerCase();
+  return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(type) ? type : "other";
 }
 
 function isHtml(headers: Headers): boolean {
-  const type = contentType(headers).toLowerCase();
-  return type.includes("text/html") || type.includes("application/xhtml+xml");
+  const type = mediaType(headers);
+  return type === "text/html" || type === "application/xhtml+xml";
 }
 
 /** One GET to one exact scope entry. The DNS answer is checked and pinned to the HTTPS connection. */
@@ -133,10 +164,22 @@ export async function passivePublicGet(
   if (!scope.approvedServices.includes("passive-public-review")) {
     throw new Error('Scope must approve the "passive-public-review" service');
   }
-  const startedAt = Date.now();
+  const startedAt = performance.now();
   const timeoutMs = scope.budgets.timeoutMs;
   const address = await dependencies.resolveAddress(url.hostname, timeoutMs);
-  const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+  const elapsedMs = performance.now() - startedAt;
+  const addressFamily = typeof address?.address === "string" ? isIP(address.address) : 0;
+  if (
+    elapsedMs >= timeoutMs ||
+    (address.family !== 4 && address.family !== 6) ||
+    addressFamily !== address.family ||
+    !isPublicAddress(address.address)
+  ) {
+    throw new Error(elapsedMs >= timeoutMs
+      ? "Public page request timed out during DNS resolution."
+      : "DNS returned a non-public or invalid address; no request was sent.");
+  }
+  const remainingMs = timeoutMs - elapsedMs;
   const maxBytes = scope.budgets.maxPublicBytesPerPage;
 
   return new Promise((resolve, reject) => {
@@ -144,6 +187,7 @@ export async function passivePublicGet(
     let bodyBytes = 0;
     const chunks: Buffer[] = [];
     let totalTimer: ReturnType<typeof setTimeout>;
+    let statusOnlyResponse: ((bytes?: number) => PublicPageResponse) | undefined;
 
     const finish = (error?: Error, response?: PublicPageResponse): void => {
       if (settled) return;
@@ -174,26 +218,39 @@ export async function passivePublicGet(
         "accept-encoding": "identity",
         "user-agent": "RevenueGuardLab/0.2 public-page-review",
       },
+      rejectUnauthorized: true,
     }, (response) => {
       const responseHeaders = safeHeadersFromResponse(response.headers);
+      const cookieFlagCounts = summarizeCookieFlags(response.headers["set-cookie"]);
+      const tlsCertificateValidation = "validated" as const;
       const status = response.statusCode || 0;
-      const elapsedMs = Date.now() - startedAt;
+      const responseWithoutBody = (bytes = 0): PublicPageResponse => ({
+        status,
+        headers: responseHeaders,
+        body: "",
+        bodyStatus: "unavailable",
+        bytes,
+        elapsedMs: performance.now() - startedAt,
+        tlsCertificateValidation,
+        cookieFlagCounts,
+      });
+      statusOnlyResponse = responseWithoutBody;
       const encoding = (response.headers["content-encoding"] || "").toString().toLowerCase();
       const claimedLength = Number(response.headers["content-length"] || 0);
 
       if (encoding && encoding !== "identity") {
         response.destroy();
-        finish(new Error("Compressed public responses are not accepted by this bounded review."));
+        finish(undefined, responseWithoutBody());
         return;
       }
       if (claimedLength > maxBytes) {
         response.destroy();
-        finish(new Error("Public page exceeded the configured response byte limit."));
+        finish(undefined, responseWithoutBody());
         return;
       }
       if (status < 200 || status >= 300 || !isHtml(responseHeaders)) {
         response.destroy();
-        finish(undefined, { status, headers: responseHeaders, body: "", bytes: 0, elapsedMs });
+        finish(undefined, responseWithoutBody());
         return;
       }
 
@@ -203,7 +260,7 @@ export async function passivePublicGet(
         if (bodyBytes > maxBytes) {
           response.destroy();
           request.destroy(new Error("Public page exceeded the configured response byte limit."));
-          finish(new Error("Public page exceeded the configured response byte limit."));
+          finish(undefined, responseWithoutBody(bodyBytes));
           return;
         }
         chunks.push(buffer);
@@ -213,16 +270,22 @@ export async function passivePublicGet(
           status,
           headers: responseHeaders,
           body: Buffer.concat(chunks).toString("utf8"),
+          bodyStatus: "complete",
           bytes: bodyBytes,
-          elapsedMs: Date.now() - startedAt,
+          elapsedMs: performance.now() - startedAt,
+          tlsCertificateValidation,
+          cookieFlagCounts,
         });
       });
-      response.on("error", (error) => finish(error instanceof Error ? error : new Error("Public page response failed.")));
+      response.on("error", () => finish(undefined, responseWithoutBody(bodyBytes)));
     });
 
     totalTimer = setTimeout(() => request.destroy(new Error("Public page request timed out.")), remainingMs);
     request.setTimeout(remainingMs, () => request.destroy(new Error("Public page request timed out.")));
-    request.on("error", (error) => finish(error instanceof Error ? error : new Error("Public page request failed.")));
+    request.on("error", (error) => {
+      if (statusOnlyResponse) finish(undefined, statusOnlyResponse(bodyBytes));
+      else finish(error instanceof Error ? error : new Error("Public page request failed."));
+    });
     request.end();
   });
 }
@@ -268,14 +331,13 @@ function imageAccessibility(html: string): { imageCount: number; missingAltCount
 function pageEvidence(url: URL, response: PublicPageResponse): AuditEvidence {
   const headers: Record<string, string> = {};
   for (const name of SAFE_RESPONSE_HEADERS) {
-    const value = response.headers.get(name);
-    if (value) headers[name] = value;
+    if (response.headers.has(name)) headers[name] = "present";
   }
   return {
     page: {
       url: url.href,
       status: response.status,
-      contentType: contentType(response.headers),
+      contentType: mediaType(response.headers),
       elapsedMs: response.elapsedMs,
       bytes: response.bytes,
       headers,
@@ -322,8 +384,8 @@ export async function executePublicReview(options: PublicReviewOptions): Promise
   if (scope.publicReadOnlyPages.length === 0) {
     throw new Error("Add exact public HTTPS pages to publicReadOnlyPages in the local scope.json before starting a passive review.");
   }
-  if (scope.publicReadOnlyPages.length > scope.budgets.maxPublicPages) {
-    throw new Error("The configured public page list exceeds its request budget.");
+  if (scope.publicReadOnlyPages.length > scope.budgets.maxPublicPages || scope.publicReadOnlyPages.length > scope.budgets.maxRequestsPerAudit) {
+    throw new Error("The configured public page list exceeds its public-page or request budget.");
   }
 
   const transport = options.transport ?? passivePublicGet;
@@ -339,21 +401,24 @@ export async function executePublicReview(options: PublicReviewOptions): Promise
       response = await transport(url, scope);
     } catch (error) {
       const message = error instanceof Error ? error.message.slice(0, 240) : "Request failed.";
-      coverageItems.push(coverage({ key: `public.fetch.${suffix}`, label: `Fetch approved page ${index + 1}`, attempted: true, status: "NOT TESTED", error: message }));
+      coverageItems.push(coverage({ key: `public.fetch.${suffix}`, label: `Fetch approved page ${index + 1}`, attempted: true, requestStatus: "unknown", status: "NOT TESTED", error: message }));
       for (const [key, label] of [["headers", "Security response headers"], ["metadata", "Page metadata"], ["accessibility", "Image alt text"]] as const) {
-        coverageItems.push(coverage({ key: `public.${key}.${suffix}`, label: `${label} · page ${index + 1}`, attempted: false, status: "NOT TESTED", error: "No page response was available." }));
+        coverageItems.push(coverage({ key: `public.${key}.${suffix}`, label: `${label} · page ${index + 1}`, attempted: false, requestStatus: "unknown", status: "NOT TESTED", error: "No page response was available." }));
       }
       continue;
     }
 
     const evidence = pageEvidence(url, response);
-    const responseDetails = `HTTP ${response.status}; ${response.bytes} body bytes read; ${response.elapsedMs} ms; ${contentType(response.headers)}.`;
-    coverageItems.push(coverage({ key: `public.fetch.${suffix}`, label: `Fetch approved page ${index + 1}`, attempted: true, status: "NOT REPRODUCED", details: `${responseDetails} One request only; no redirects or page assets were fetched.` }));
+    const responseDetails = `HTTP ${response.status}; ${response.bytes} body bytes read; ${response.elapsedMs} ms; ${mediaType(response.headers)}.`;
+    coverageItems.push(coverage({ key: `public.fetch.${suffix}`, label: `Fetch approved page ${index + 1}`, attempted: true, requestStatus: "response-received", status: "NOT REPRODUCED", details: `${responseDetails} One request only; no redirects or page assets were fetched.` }));
 
-    const isSuccessfulHtml = response.status >= 200 && response.status < 300 && isHtml(response.headers) && response.body.length > 0;
+    const isSuccessfulResponse = response.status >= 200 && response.status < 300;
+    const isHtmlResponse = isHtml(response.headers);
+    const isSuccessfulHtml = isSuccessfulResponse && isHtmlResponse && response.bodyStatus !== "unavailable" && response.body.length > 0;
+    const canAssessSecurityHeaders = isSuccessfulResponse && isHtmlResponse;
     const missingHeaders = REQUIRED_SECURITY_HEADERS.filter((name) => !response.headers.has(name));
-    if (response.status >= 200 && response.status < 300 && missingHeaders.length > 0) {
-      coverageItems.push(coverage({ key: `public.headers.${suffix}`, label: `Security response headers · page ${index + 1}`, attempted: true, status: "SUSPECTED", details: `Missing: ${missingHeaders.join(", ")}. Header recommendations depend on the site's architecture.` }));
+    if (canAssessSecurityHeaders && missingHeaders.length > 0) {
+      coverageItems.push(coverage({ key: `public.headers.${suffix}`, label: `Security response headers · page ${index + 1}`, attempted: true, requestStatus: "response-received", status: "SUSPECTED", details: `Missing: ${missingHeaders.join(", ")}. Header recommendations depend on the site's architecture.` }));
       findings.push(makePublicFinding({
         key: "public.missing-security-headers",
         title: "Public page is missing baseline security response headers",
@@ -372,16 +437,20 @@ export async function executePublicReview(options: PublicReviewOptions): Promise
       coverageItems.push(coverage({
         key: `public.headers.${suffix}`,
         label: `Security response headers · page ${index + 1}`,
-        attempted: response.status >= 200 && response.status < 300,
-        status: response.status >= 200 && response.status < 300 ? "NOT REPRODUCED" : "NOT TESTED",
-        details: response.status >= 200 && response.status < 300 ? "All listed baseline headers were present." : "The response was not a 2xx page; headers were not assessed as a page configuration.",
-        ...(response.status >= 200 && response.status < 300 ? {} : { error: "Response status was outside the range used for page checks; redirects were not followed." }),
+        attempted: canAssessSecurityHeaders,
+        requestStatus: "response-received",
+        status: canAssessSecurityHeaders ? "NOT REPRODUCED" : "NOT TESTED",
+        details: canAssessSecurityHeaders ? "All listed baseline headers were present." : "The response was not a successful HTML page; headers were not assessed as a page configuration.",
+        ...(canAssessSecurityHeaders ? {} : { error: "Response was outside the successful HTML page range used for this check; redirects were not followed." }),
       }));
     }
 
     if (!isSuccessfulHtml) {
+      const bodyUnavailable = isSuccessfulResponse && isHtmlResponse && response.bodyStatus === "unavailable";
       for (const [key, label] of [["metadata", "Page metadata"], ["accessibility", "Image alt text"]] as const) {
-        coverageItems.push(coverage({ key: `public.${key}.${suffix}`, label: `${label} · page ${index + 1}`, attempted: false, status: "NOT TESTED", error: "Response was not a non-empty 2xx HTML page; no redirect or follow-up request was made." }));
+        coverageItems.push(coverage({ key: `public.${key}.${suffix}`, label: `${label} · page ${index + 1}`, attempted: false, requestStatus: "response-received", status: "NOT TESTED", error: bodyUnavailable
+          ? "The HTML response body was unavailable within the configured transport limits; no content checks were run."
+          : "Response was not a non-empty 2xx HTML page; no redirect or follow-up request was made." }));
       }
       continue;
     }
@@ -393,7 +462,7 @@ export async function executePublicReview(options: PublicReviewOptions): Promise
       metadata.h1Count !== 1 ? `found ${metadata.h1Count} H1 headings` : "",
     ].filter(Boolean);
     if (metadataIssues.length > 0) {
-      coverageItems.push(coverage({ key: `public.metadata.${suffix}`, label: `Page metadata · page ${index + 1}`, attempted: true, status: "SUSPECTED", details: `${metadataIssues.join("; ")}. Title length ${metadata.titleLength}; description length ${metadata.descriptionLength}; H1 count ${metadata.h1Count}.` }));
+      coverageItems.push(coverage({ key: `public.metadata.${suffix}`, label: `Page metadata · page ${index + 1}`, attempted: true, requestStatus: "response-received", status: "SUSPECTED", details: `${metadataIssues.join("; ")}. Title length ${metadata.titleLength}; description length ${metadata.descriptionLength}; H1 count ${metadata.h1Count}.` }));
       findings.push(makePublicFinding({
         key: "public.page-metadata",
         title: "Public page has incomplete or unclear search metadata",
@@ -409,12 +478,12 @@ export async function executePublicReview(options: PublicReviewOptions): Promise
         evidence,
       }));
     } else {
-      coverageItems.push(coverage({ key: `public.metadata.${suffix}`, label: `Page metadata · page ${index + 1}`, attempted: true, status: "NOT REPRODUCED", details: `Title length ${metadata.titleLength}; description length ${metadata.descriptionLength}; one H1 heading.` }));
+      coverageItems.push(coverage({ key: `public.metadata.${suffix}`, label: `Page metadata · page ${index + 1}`, attempted: true, requestStatus: "response-received", status: "NOT REPRODUCED", details: `Title length ${metadata.titleLength}; description length ${metadata.descriptionLength}; one H1 heading.` }));
     }
 
     const accessibility = imageAccessibility(response.body);
     if (accessibility.missingAltCount > 0) {
-      coverageItems.push(coverage({ key: `public.accessibility.${suffix}`, label: `Image alt text · page ${index + 1}`, attempted: true, status: "SUSPECTED", details: `${accessibility.missingAltCount} of ${accessibility.imageCount} image tags lacked an alt attribute.` }));
+      coverageItems.push(coverage({ key: `public.accessibility.${suffix}`, label: `Image alt text · page ${index + 1}`, attempted: true, requestStatus: "response-received", status: "SUSPECTED", details: `${accessibility.missingAltCount} of ${accessibility.imageCount} image tags lacked an alt attribute.` }));
       findings.push(makePublicFinding({
         key: "public.images-missing-alt",
         title: "Some page images have no alt attribute",
@@ -430,7 +499,7 @@ export async function executePublicReview(options: PublicReviewOptions): Promise
         evidence,
       }));
     } else {
-      coverageItems.push(coverage({ key: `public.accessibility.${suffix}`, label: `Image alt text · page ${index + 1}`, attempted: true, status: "NOT REPRODUCED", details: `${accessibility.imageCount} image tag(s) observed; each had an alt attribute.` }));
+      coverageItems.push(coverage({ key: `public.accessibility.${suffix}`, label: `Image alt text · page ${index + 1}`, attempted: true, requestStatus: "response-received", status: "NOT REPRODUCED", details: `${accessibility.imageCount} image tag(s) observed; each had an alt attribute.` }));
     }
   }
 

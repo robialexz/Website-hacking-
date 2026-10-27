@@ -1,12 +1,13 @@
 # Getting started
 
-RevenueGuard Lab provides three separate workflows:
+RevenueGuard Lab provides four separate local workflows:
 
 - **Local security audit:** fixed, non-destructive checks against the bundled synthetic app at `127.0.0.1:8765`.
 - **Approved source review:** read-only pattern checks against explicitly listed JavaScript and TypeScript directories on disk.
-- **Public-page review:** bounded observations from one unauthenticated GET to each exact HTTPS page in local `scope.json`. GET requests can still trigger side effects on some sites, so this review is not guaranteed to be read-only.
+- **Passive SEO/accessibility review:** bounded page metadata and image alt-text observations from exact HTTPS pages in local `scope.json`.
+- **HTTPS posture review:** a separate `posture-review` action that records limited HTTPS response observations from exact scoped pages.
 
-The dynamic audit never targets public sites. The source review makes no network requests and does not execute project code. The public-page review does not perform vulnerability probes, crawl pages, follow redirects, or send credentials; a GET can still trigger an action on a site.
+The dynamic audit never targets public sites. The source review makes no network requests and does not execute project code. Both public workflows send one unauthenticated GET per exact scoped page when an operator starts a run. They do not crawl, follow redirects, send credentials, submit forms, or send payload probes. A GET can still trigger a site action. The operator attestation requested for HTTPS posture observations is not proof of authorization. This is a local-only single-user learning application, not a production multi-user scanning service.
 
 ## Start the lab
 
@@ -52,7 +53,7 @@ Select **Review approved source**. The four current checks look for:
 
 Every source match is **Suspected**. Findings include the relative file and line, a redacted code excerpt, a SHA-256 file hash, and a remediation suggestion. These pattern checks can miss issues and produce false positives; validate the surrounding code manually. The app does not patch source files.
 
-## Review an approved public page
+## Review passive SEO and accessibility observations
 
 The checked-in `scope.example.json` enables only `revenueguard-demo` and leaves `publicReadOnlyPages` empty. To opt in, add `passive-public-review` to `approvedServices` and one or more exact canonical HTTPS page URLs to the local `scope.json`, for example:
 
@@ -64,21 +65,29 @@ Do not include a query string, fragment, credentials, or a nondefault port. The 
 
 Select **Review approved pages** to make one direct, unauthenticated GET per listed page. The request sends no cookies, authorization, or referrer; it does not follow redirects, fetch assets, parse links for follow-up, submit forms, or retry. DNS answers must all be public addresses, and the connection is pinned to a checked address with TLS verification enabled.
 
-Before every run, the app displays the exact page list and asks you to confirm that you own or have permission to review it and that each URL is safe to request. Some sites attach actions to GET routes, so do not include tokenized or state-changing URLs. The app cannot guarantee that a GET is side-effect-free.
+Before every run, the app displays the exact page list and asks you to confirm that you own or have permission to review those pages and that each GET is safe to request. This confirmation is an operator attestation, not proof of authorization. Some sites attach actions to GET routes, so do not include tokenized or state-changing URLs. The app cannot guarantee that a GET is side-effect-free.
 
-Each report lists the exact pages captured with the job's scope. It stores response status, timing/byte measurements, selected security-header values, and page metadata counts, but not the HTML body or arbitrary response headers. Results are **Suspected** observations about response headers, basic search metadata, or image alt attributes. They are not an active security assessment, a ranking prediction, or a revenue estimate.
+Each report lists the exact pages captured with the job's scope. It stores response status, timing/byte measurements, and page metadata counts, but not the HTML body or arbitrary response headers. Results are **Suspected** observations about basic search metadata and image alt attributes. They are not a security assessment, a ranking prediction, or a revenue estimate.
+
+## Review HTTPS posture observations
+
+The separate `posture-review` action reports a limited set of observable HTTPS response properties: normalized summaries for HSTS, CSP, and selected browser headers; whether the TLS certificate and hostname were validated for the connection; and aggregate cookie flag counts. It uses the same `passive-public-review` approval, exact `publicReadOnlyPages` list, and request budgets described above. No extra scope setting or approval name is required. A run accepts at most four selected pages, with a 1 MB response cap and a 30-second request timeout.
+
+Before each run, the operator must attest that they own or have permission to review the exact listed pages and that each page is safe to request. This attestation is not proof or verification of authorization. The review sends one unauthenticated GET per exact scoped page. It does not crawl pages, use authentication, submit forms, send payload probes, or follow redirects. GET requests can still have side effects, so leave out URLs that may trigger account changes, confirmations, unsubscribes, or other actions.
+
+These results are observations of a limited HTTPS response surface, not an active vulnerability scan or a conclusion that a site is secure. The app is local-only and single-user; it is not a production multi-user service.
 
 ## Scope settings
 
 `scope.json` is local and excluded from source control. Its fields describe the exact enabled capabilities:
 
 - `approvedOrigins` and `approvedPathPrefixes` remain literal loopback scope for the synthetic app.
-- `approvedServices` starts with only the synthetic demo. Add `source-review` or `passive-public-review` only when you intend to enable those separate capabilities.
+- `approvedServices` starts with only the synthetic demo. Add `source-review` or `passive-public-review` only when you intend to enable them. The `passive-public-review` approval is shared by the separate passive SEO/accessibility and `posture-review` actions.
 - `sourceDirectories` is the source-file allowlist.
 - `testAccounts` names only the synthetic fixture identities.
 - `approvedCallbacks` must stay empty in this release.
-- `publicReadOnlyPages` is the exact HTTPS page allowlist for public-page review; the field name does not guarantee a GET has no side effects.
-- `budgets` limits requests, worker concurrency, source files/bytes, public pages/response bytes, and timeouts.
+- `publicReadOnlyPages` is the exact HTTPS page allowlist shared by both public workflows; the field name does not guarantee a GET has no side effects.
+- `budgets` limits requests, worker concurrency, source files/bytes, public pages/response bytes, and timeouts. `maxResponseBytes` caps dynamic loopback response bodies at 2 MB by default (1 KB–20 MB); `timeoutMs` is capped at 30 seconds.
 - `resetProcedure` describes the supported synthetic profile reset.
 
 Older generated scope files preserve their existing `approvedServices` list and get safe in-memory defaults for newer budgets and an empty `publicReadOnlyPages` list. Existing origins, paths, and source directories are preserved. Interrupted jobs are marked failed after restart and are not replayed automatically. Restart the app after editing this file.

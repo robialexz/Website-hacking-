@@ -22,11 +22,12 @@
         <a class="nav-item" href="#jobs"><span class="nav-icon">◷</span> Audit runs</a>
         <a class="nav-item" href="#source-review"><span class="nav-icon">⌘</span> Source review</a>
         <a class="nav-item" href="#passive-review"><span class="nav-icon">↗</span> Public review</a>
+        <a class="nav-item" href="#posture-review"><span class="nav-icon">↗</span> HTTPS posture</a>
         <a class="nav-item" href="#scope"><span class="nav-icon">◎</span> Scope & safety</a>
       </nav>
       <div class="sidebar-bottom">
         <div class="lab-status"><span class="status-dot"></span><div><b>Loopback lab</b><small>Public review is opt-in</small></div></div>
-        <p>RevenueGuard Lab<br>Offline security validation</p>
+        <p>RevenueGuard Lab<br>Local security validation</p>
       </div>
     </aside>
 
@@ -54,17 +55,40 @@
           <button class="button button-secondary" id="publicReviewButton" disabled>Configure approved pages</button>
         </section>
 
+        <section class="panel source-review-panel posture-review-panel" id="posture-review">
+          <div style="flex: 1; min-width: 0;">
+            <p class="eyebrow">LIMITED HTTPS OBSERVATIONS · OPT IN</p>
+            <h2>HTTPS posture observations</h2>
+            <p>Select exact configured HTTPS URLs for this run. RevenueGuard sends one unauthenticated GET per selected page. It does not crawl, follow redirects, or send credentials or cookies. Observations cover only limited response properties on the selected pages.</p>
+            <fieldset>
+              <legend>Exact configured URLs · maximum four per run</legend>
+              <p id="posturePageSelectionSummary">Loading configured URLs…</p>
+              <ul id="posturePageList" aria-label="Configured HTTPS URLs"></ul>
+            </fieldset>
+            <p>Exact URLs are saved with run history and retained in local reports. URL paths may contain sensitive identifiers or tokens; only configure routes you are willing to retain.</p>
+            <fieldset>
+              <legend>Required for each run</legend>
+              <p><label><input type="checkbox" id="postureAuthorizationAttestation"> I attest that I am authorized to request these exact URLs for this run.</label></p>
+              <p><label><input type="checkbox" id="postureSafeGetAttestation"> I attest that one unauthenticated GET to each selected route is safe, and understand GET requests may still trigger site actions.</label></p>
+            </fieldset>
+            <p>Authorization is self-attested and is not independently verified. These limited response observations are not a vulnerability scan. No observations do not establish that a site is secure.</p>
+            <p id="postureRunHint" role="status" aria-live="polite">Select one or more exact URLs and confirm both statements to continue.</p>
+          </div>
+          <button class="button button-secondary" id="postureReviewButton" disabled>Run HTTPS posture observations</button>
+        </section>
+
         <div class="metric-grid" aria-label="Audit summary">
-          <article class="metric-card"><div class="metric-top"><span>Confirmed findings</span><span class="metric-icon red">!</span></div><strong id="confirmedCount">—</strong><small>Reproduced with local evidence</small></article>
+          <article class="metric-card"><div class="metric-top"><span>Confirmed</span><span class="metric-icon red">!</span></div><strong id="confirmedCount">—</strong><small>From latest completed run</small></article>
           <article class="metric-card"><div class="metric-top"><span>Suspected</span><span class="metric-icon amber">?</span></div><strong id="suspectedCount">—</strong><small>Needs manual validation</small></article>
+          <article class="metric-card"><div class="metric-top"><span>Observed</span><span class="metric-icon blue">i</span></div><strong id="observedCount">—</strong><small>Informational observations</small></article>
           <article class="metric-card"><div class="metric-top"><span>Audit runs</span><span class="metric-icon blue">◷</span></div><strong id="jobCount">—</strong><small>Persisted in local SQLite</small></article>
-          <article class="metric-card"><div class="metric-top"><span>Coverage checks</span><span class="metric-icon green">✓</span></div><strong id="coverageCount">—</strong><small>From the latest completed run</small></article>
+          <article class="metric-card"><div class="metric-top"><span>Coverage checks</span><span class="metric-icon green">✓</span></div><strong id="coverageCount">—</strong><small>Attempted / available; inspect outcomes in the report</small></article>
         </div>
 
         <div class="section-grid">
           <section class="panel findings-panel" id="findings">
-            <div class="panel-heading"><div><p class="eyebrow">EVIDENCE-BASED</p><h2>Latest findings</h2></div><span id="findingsTotal" class="muted-label">0 total</span></div>
-            <div class="table-wrap"><table><thead><tr><th>Finding</th><th>Severity</th><th>Status</th><th>Confidence</th><th></th></tr></thead><tbody id="findingsBody"><tr><td colspan="5" class="empty">No findings yet. Run a local audit or an approved source or public page review.</td></tr></tbody></table></div>
+            <div class="panel-heading"><div><p class="eyebrow">EVIDENCE-BASED</p><h2>Latest findings and observations</h2></div><span id="findingsTotal" class="muted-label">0 total</span></div>
+            <div class="table-wrap"><table><thead><tr><th>Finding</th><th>Severity</th><th>Status</th><th>Confidence</th><th></th></tr></thead><tbody id="findingsBody"><tr><td colspan="5" class="empty">No findings recorded. An empty findings list does not establish that a target is secure.</td></tr></tbody></table></div>
           </section>
           <section class="panel jobs-panel" id="jobs">
             <div class="panel-heading"><div><p class="eyebrow">EXECUTION HISTORY</p><h2>Recent audit runs</h2></div><span class="muted-label">Local queue</span></div>
@@ -86,7 +110,7 @@
           </div>
         </section>
 
-        <footer class="footer"><span>RevenueGuard Lab <span id="appVersion"></span></span><span>Local-first · no cloud calls · no crawling or target discovery</span></footer>
+        <footer class="footer"><span>RevenueGuard Lab <span id="appVersion"></span></span><span>Local-only app · no cloud processing · optional public reviews contact only selected sites · no crawling or target discovery</span></footer>
       </section>
     </main>
   </div>

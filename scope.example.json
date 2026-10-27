@@ -26,7 +26,8 @@
     "maxSourceFiles": 500,
     "maxSourceBytes": 2000000,
     "maxPublicPages": 4,
-    "maxPublicBytesPerPage": 1000000
+    "maxPublicBytesPerPage": 1000000,
+    "maxResponseBytes": 2000000
   },
   "resetProcedure": "POST /api/lab/profile with {\"profile\":\"vulnerable\"} or {\"profile\":\"secure\"} resets synthetic state. No real data is used."
 }
