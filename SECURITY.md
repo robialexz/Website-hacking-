@@ -2,11 +2,15 @@
 
 ## Safe use
 
-RevenueGuard Lab is intentionally restricted to a synthetic demo service on the local machine. The vulnerable routes under `/lab/` are part of the training fixture; their results do not describe any other system.
+RevenueGuard Lab is a local-only learning application. Its vulnerable routes under `/lab/` are a synthetic fixture; those results do not describe any other system. A separate optional HTTPS posture workflow makes bounded observations of exact HTTPS pages listed in local `scope.json`.
 
-Do not use this project to test websites, networks, or accounts unless you own them and have explicit authorization. This release is not designed to accept external targets. Do not change its loopback binding, fixed audit origin, or scope guard to reach public systems.
+Use HTTPS posture observations only for exact pages that you own or are explicitly authorized to review, and only when a single unauthenticated GET to each page is safe. Before a run, the operator must attest to that authorization and safety. The attestation is not verification or proof of authorization. GET requests can still trigger side effects, so exclude state-changing, tokenized, confirmation, unsubscribe, and similar URLs.
 
-The demo uses synthetic users and records, fake in-memory files, fixed input canaries, and a fictional dependency marker. It makes no external callbacks and performs no real purchases or file reads.
+The posture workflow is limited to one unauthenticated GET per exact scoped page. It does not crawl, follow links or redirects, use authentication, submit forms, or send payload probes. It is not an active vulnerability scan and does not establish that a site is secure. Do not change the loopback binding, fixed synthetic audit origin, or scope guard to enable active tests against public systems.
+
+The app is intended for one local operator. It has no production multi-user accounts or tenant isolation; do not expose it to a network or present it as a hosted production scanning service.
+
+The synthetic demo uses fake users and records, in-memory files, fixed input canaries, and a fictional dependency marker. It makes no external callbacks and performs no real purchases or file reads. The passive SEO/accessibility review is separate from both the synthetic demo and the HTTPS posture workflow.
 
 ## Reporting a defect in this project
 
