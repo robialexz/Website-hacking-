@@ -1,139 +1,82 @@
-# RevenueGuard Lab
+# RevenueGuard
 
-> A local-only security learning tool with a synthetic loopback audit, local source review, passive SEO/accessibility observations, and optional HTTPS posture observations. It is not a production multi-user scanning service.
+RevenueGuard is a local, single-operator website security baseline scanner. It makes bounded, unauthenticated HTTPS GET requests to one public DNS origin at a time, follows eligible same-origin links, records limited response and markup observations, and produces a coverage report.
 
-![RevenueGuard Lab overview illustration](revenueguard-lab-social-preview.jpg)
+It is designed for websites you own or are explicitly authorized to review. Authorization is self-attested for each run and is not independently verified. GET requests can still trigger side effects on an unknown route.
 
-RevenueGuard Lab is a small, dependency-free, local-only learning project. Its synthetic lab audit targets only the demo service included in this repository. A separate source review checks JavaScript and TypeScript files under explicitly scoped local directories. The passive SEO/accessibility review and the HTTPS posture review are separate actions; each uses exact HTTPS pages in local `scope.json` and makes one unauthenticated GET per page when started. The posture review requires an operator attestation that the pages are authorized and safe to request. That attestation is not proof of authorization. A GET can still trigger a site action. Neither public workflow crawls pages, sends authentication, submits forms, or probes payloads.
+![RevenueGuard overview](revenueguard-lab-social-preview.jpg)
 
-## Quick start
+## Start RevenueGuard
 
-### Requirements
-
-- Node.js 26 or newer.
-- No `npm install`, API key, or database server is needed. Internet access is not used by the synthetic audit or source review. The optional public-page and HTTPS posture reviews need network access only when an operator starts them.
-
-### Run it
+Requirements: Node.js 24.15 or newer. Runtime code has no npm dependencies.
 
 ```sh
 git clone https://github.com/robialexz/revenueguard-lab.git
 cd revenueguard-lab
-node --version   # confirm v26 or newer
+node --version
 npm start
 ```
 
-Open **http://127.0.0.1:8765** in your browser. On its first start, the app creates `scope.json` from `scope.example.json` and creates `data/revenueguard.sqlite` for local run history. Both are local files and are excluded from source control.
+Open <http://127.0.0.1:8765>. The app listens on loopback only. On first start it copies `scope.example.json` to the untracked local `scope.json` and creates `data/revenueguard.sqlite` for run history. No website is contacted during startup.
 
-### Run the vulnerable-versus-secure walkthrough
+The default port is 8765. To use another port on a fresh checkout, first copy `scope.example.json` to `scope.json`, add the matching origin (for example `http://127.0.0.1:8877`) to `approvedOrigins`, then start with `REVENUEGUARD_PORT=8877 npm start`. The app still binds to loopback.
 
-1. In **Demo profile**, select **Vulnerable examples**.
-2. Select **Run local audit** and wait for the job to finish.
-3. Open findings to review their evidence, expected behavior, impact, and suggested remediation.
-4. Select **Secure controls**.
-5. Select **Retest findings** to check whether the earlier confirmed demo behaviors still reproduce.
-6. Open a report from the run history and use **Print / Save as PDF** if you want a copy.
+The checked-in example enables the synthetic fixture, local source review, and `web-scan`. Older scope files with `mode: "laboratory"` are migrated in memory to scanner mode and gain the `web-scan` capability. That migration selects no target and sends no request; each scan still requires a target URL and two per-run confirmations.
 
-### Review local source code
+## Run an authorized web scan
 
-1. The example scope enables only `revenueguard-demo`. Add `source-review` to `approvedServices` to enable local source review, then confirm the directories under `sourceDirectories` are the folders you intend to inspect. The default is `./src`.
-2. For another local project, add its exact source directory to `sourceDirectories`. Absolute paths are accepted only when they resolve inside a recognizable local project. Symlinks are rejected or skipped.
-3. Restart RevenueGuard Lab after editing `scope.json`, then select **Review approved source**. The checks look for dynamic code evaluation, disabled TLS certificate validation, credential-like literals, and dynamic HTML insertion.
-4. Open each result
+1. Open **Web scan** and replace `https://<your-domain>/` with an absolute HTTPS URL for a public DNS hostname you own or are authorized to test. The hostname must resolve only to public addresses. IP literals, non-default ports, query strings, fragments, credentials, action-like routes, and token-shaped path segments are rejected.
+2. Review the page, depth, request, duration, response-body, timeout, and delay budgets shown under **Scope & safety**. You may lower the per-run page and depth limits.
+3. Confirm that you own the target or have permission to test it, and that unauthenticated GET requests are acceptable. Changing the target or either budget clears both confirmations.
+4. Select **Start web scan**. Use **Stop scan** to abort the active request and prevent later pages from being requested. Requests already received by a server cannot be undone.
+5. Review the findings and coverage report. An empty findings list is not a security verdict. The report records which checks ran, which routes were skipped, and where a budget or cancellation limited coverage.
 
-The default source budget is 500 files and 2 MB in total. Generated folders, hidden folders, binary files, and files outside the JavaScript/TypeScript extensions supported by the scanner are skipped. If a limit is reached, coverage says the review is incomplete.
+The scanner does not log in, send cookies or credentials, submit forms, follow redirects, fetch static assets, or send exploit payloads. It skips query-string links, obvious action-like paths, ambiguous encoded paths, and links outside the starting HTTPS origin. It uses a bounded HTML tokenizer; it does not run JavaScript or discover routes that are only rendered by client-side code.
 
-### Review passive SEO and accessibility observations
+The baseline checks observe:
 
-The checked-in example enables only `revenueguard-demo` and leaves `publicReadOnlyPages` empty. To enable a public-page review, add `passive-public-review` to `approvedServices` and add the exact canonical HTTPS page URL to `publicReadOnlyPages` in your local scope, for example `https://example.com/`. Do not add a query string or fragment. The list is capped at four pages by default.
+- HSTS, Content Security Policy, `X-Content-Type-Options`, Referrer-Policy, framing controls, and Permissions-Policy.
+- TLS certificate-chain and hostname validation for the HTTPS connection.
+- Cookie `Secure`, `HttpOnly`, and `SameSite` attribute counts, without retaining cookie names or values.
+- A wildcard `Access-Control-Allow-Origin` header, without sending an `Origin` header or testing browser read access.
+- Numeric software-version patterns in `Server` and `X-Powered-By` headers.
+- HTTP resources embedded in HTTPS markup, form actions using HTTP, and missing Subresource Integrity on external scripts or stylesheets.
 
-Restart RevenueGuard Lab after editing the scope, then select **Review approved pages**. This action reports basic page metadata and image alt-text observations. It is separate from HTTPS posture observations and from the synthetic lab audit. A single unauthenticated GET can still trigger an action on some sites, so do not list tokenized or state-changing pages.
+These are limited passive observations. RevenueGuard does not test authentication, access control, SQL injection, cross-site scripting, server-side request forgery, business logic, dependency advisories, or authenticated application behavior. It is not a comprehensive DAST or compliance tool. Heuristic action-path exclusions cannot identify every side-effecting GET route; do not scan routes with tokens, account actions, purchases, or sensitive identifiers.
 
-RevenueGuard makes one direct GET per listed page without credentials, cookies, referrers, retries, or asset requests. It does not follow redirects or links. It records response status, a timing and byte measurement, metadata lengths/counts, and image alt-attribute counts. The HTML body is parsed in memory and is not saved in SQLite or reports.
+## Other local workflows
 
-Each report lists the exact pages captured in that run's scope. Results are **Suspected** page-level SEO and accessibility observations, not an active security assessment, ranking prediction, or revenue estimate. A 3xx response is recorded without following its `Location` header. If DNS resolves to a private or reserved address, the request is stopped before connecting.
+- **Local fixture checks:** demonstrate intentionally vulnerable and secure behaviors against synthetic users, records, routes, and files bundled with RevenueGuard. They never target the supplied website.
+- **Local source review:** inspect approved JavaScript and TypeScript directories for a small set of risky patterns. It is heuristic and does not execute or patch code.
+- **HTTPS posture review and public page review:** optional one-GET-per-exact-page workflows configured with `passive-public-review` and `publicReadOnlyPages` in local `scope.json`. They are separate from the crawler and also require per-run consent.
 
-### Review HTTPS posture observations
+See [Getting started](docs/getting-started.md) for configuration and workflow details.
 
-The HTTPS posture review is a separate `posture-review` action for a small set of observable HTTPS response properties: normalized HSTS/CSP/browser-header summaries, TLS certificate and hostname validation for the connection, and cookie flag counts. It uses the same `passive-public-review` approval and exact `publicReadOnlyPages` allowlist shown above; no additional scope key or service is needed. The default budget allows at most four pages and caps each response at 1 MB and each request at 30 seconds.
+## Local data and privacy
 
-Before each run, the operator must attest that they own or have permission to review the exact listed pages and that each URL is safe to request. This is an operator attestation, not verification or proof of authorization. The review sends one unauthenticated GET per exact scoped page. It sends no cookies or credentials, does not crawl or follow redirects, submit forms, or send payload probes, and does not automatically retry. A GET may still cause a side effect on some sites; exclude state-changing URLs and stop if a response suggests the request was unsafe.
+Run history is stored in `data/revenueguard.sqlite`. For web scans, the full starting URL is held in process memory only while that run is queued or active; local history stores the origin and aggregate observations, while reports omit route paths. Startup removes paths saved by older web-scan builds. Other configured exact-page workflows retain their configured URLs. HTML response bodies, cookie names, and cookie values are not retained.
 
-Treat the results as limited observations of the responses received. They are not an active vulnerability scan, do not establish that a site is secure or authorized, and are not a compliance assessment. RevenueGuard runs as a local-only, single-user application; it is not a hosted or production multi-user service.
+There is no automatic expiry or per-run deletion screen. Stop RevenueGuard and remove `data/revenueguard.sqlite` to clear local run history. Remove sensitive configured URLs separately from `scope.json`.
 
-A retest marks an earlier confirmed finding as fixed only if all required checks validate their expected safe controls. A timeout, server error, missing route, or other unverified response is incomplete evidence; it cannot prove a fix.
+## Security boundary
 
-## What the checks demonstrate
+- The dashboard binds to `127.0.0.1` on port 8765 by default and requires a same-origin CSRF token for mutations. `REVENUEGUARD_PORT` can select another loopback port. It has no user accounts or multi-tenant isolation; do not expose it on a network interface. `/api/health.externalNetworkEnabled` reports whether an external workflow is enabled, not whether a request is currently active.
+- The web scanner allows HTTPS on port 443 for a single origin per run. Every DNS answer is checked against private and reserved address ranges; the chosen public address is pinned to the HTTPS connection, TLS verification remains enabled, and redirects are not followed.
+- The crawler sends no authorization, cookies, referrer, form submissions, or probe payloads. Request, page, depth, duration, timeout, in-memory body-processing, and pacing budgets are enforced. Response bodies are buffered only for parsing, then discarded; a received network chunk can exceed the remaining in-memory allowance before the connection is stopped.
+- Cancellation stops the current request and prevents queued routes from starting. A GET already received by a remote server may have had an effect.
+- The operator confirmations record intent, not proof of ownership or permission.
 
-The audit runs seven deterministic checks against the built-in fixture:
+For a hosted service, additional work would be required: identity and authorization, tenant isolation, a durable isolated worker queue, secret handling, data-retention controls, monitoring, and an independently reviewed network boundary. This repository is production-oriented for local single-operator use; it is not a hosted multi-user scanner.
 
-| Check | What the vulnerable example demonstrates | What it does not prove |
-| --- | --- | --- |
-| Record authorization | A synthetic user can read another synthetic user's record. | No real account or customer data is accessed. |
-| Admin authorization | The synthetic admin panel responds without credentials. | No real administrative system is contacted. |
-| Search filter canary | A fixed lab marker returns more synthetic rows than an unmatched query. | This is not SQL execution or a verified SQL injection. |
-| Reflected HTML canary | A fixed SVG marker is returned unescaped in an HTML response. | The audit does not open a browser to execute it; arbitrary query text is escaped. |
-| Fake file boundary | A hard-coded marker for a fake private file is returned. | No host file is read; the file exists only in memory. |
-| Single-use discount | The same synthetic discount succeeds twice. | No payment, purchase, or real transaction occurs. |
-| Dependency marker | A fictional `RG-DEMO-001` marker is shown for cautious triage. | It is not a real advisory and is reported as suspected only. |
-
-The source review, passive SEO/accessibility review, and HTTPS posture review are separate from the dynamic fixture audit. They do not change the vulnerable or secure demo profile. Passive SEO/accessibility observations are marked **Suspected**; posture output is marked **Observed** or **Inconclusive**. Neither status is an exploitability claim, and an empty observation list does not establish security.
-
-The secure profile provides the expected denial, encoding, or one-time-use behavior for these fixtures. Reports distinguish confirmed fixture behavior from suspected markers and include the scope caveat.
-
-## Reports and local data
-
-The dashboard keeps recent jobs, findings, evidence, and logs in `data/revenueguard.sqlite`. The database stays on your machine. Generated reports are available at:
-
-- `/reports/<job-id>/technical`
-- `/reports/<job-id>/executive`
-- `/reports/<job-id>/remediation`
-
-Each report includes a scope note. Public-page reports also list the exact URLs captured when that job was queued; queued or interrupted jobs are marked failed after an app restart and are never replayed automatically.
-
-The app has no per-run deletion screen or automatic retention period. It stores exact posture target URLs, normalized header summaries, coverage, findings, and logs locally; it does not store response bodies, cookie names, or cookie values. To clear local history, stop the app and delete `data/revenueguard.sqlite`; remove target URLs separately from your local `scope.json`.
-
-## Safety boundary
-
-- The web server binds only to `127.0.0.1:8765`, checks the request host and local socket, and does not listen on your network interface.
-- The dynamic audit uses a fixed loopback demo origin and requires it to appear in the scope config. Paths and payloads are fixed in code; adding another origin does not redirect the audit.
-- The dynamic scope guard accepts literal loopback addresses and approved paths only. Redirects are disabled, requests have a timeout and per-audit budget, and `maxResponseBytes` caps the response body at 2 MB by default (configurable from 1 KB to 20 MB).
-- `sourceDirectories` is an explicit local filesystem allowlist. Source review reads regular JavaScript/TypeScript files only, rejects a symlinked approved root, skips symlinked entries, and enforces file-count and byte budgets.
-- `publicReadOnlyPages` is a separate exact-URL allowlist shared by the public-page and HTTPS posture reviews. Each run requires operator confirmation because an ordinary GET can still trigger a site action; this confirmation is not proof of authorization.
-- `approvedServices` starts with only the synthetic demo. Add source or public review only when you intend to enable it; `passive-public-review` is shared by the SEO/accessibility and HTTPS posture actions. Migrations preserve existing approvals. Synthetic `testAccounts`, empty `approvedCallbacks`, and `resetProcedure` are validated against this release's capabilities.
-- Users, records, discounts, dependency data, and files are synthetic. The fake file is stored in memory.
-- No public-target discovery, crawling, external callback, cloud AI, or live advisory download is enabled. Only the optional exact-page public workflows make outbound requests, after a local operator starts them.
-
-**Use the public-page and HTTPS posture reviews only for exact pages you own or have permission to review, and only when each GET is safe to request.** The operator attestation is not proof of authorization. Some sites attach side effects to GET routes. The dynamic audit cannot target remote systems, and the public workflows cannot target arbitrary URLs. The vulnerable profile is a toy fixture for local learning.
-
-## Development
+## Verify a change
 
 ```sh
-npm test
+npm ci
+npm run verify
 ```
 
-The tests use Node's built-in test runner
-
-### Project layout
-
-```text
-src/server.ts          Local HTTP server, dashboard API, queue, SQLite history, and reports
-src/audit.ts           Fixed audit checks and evidence generation
-src/source-review.ts   Read-only, budgeted static checks for scoped local source
-src/public-review.ts   Exact-page passive HTTPS checks with DNS pinning and response limits
-src/posture-review.ts Limited HTTPS posture observations using the same bounded transport
-src/lab-target.ts      Synthetic vulnerable and secure demo behaviors
-src/scope.ts           Strict local/public allowlists and request-budget validation
-src/*.test.ts          Unit tests for demo checks, source review, and passive transport behavior
-public/                Dashboard and printable report UI
-scope.example.json     Safe local scope template copied on first start
-docs/getting-started.md Setup and scope instructions for all four workflows
-```
-
-## Current limitations
-
-This release does not perform active security testing against another application. The source review currently checks four patterns; it is not a complete SAST engine, does not resolve dependencies, does not apply patches, and may miss issues or return false positives. The passive SEO/accessibility and HTTPS posture reviews are bounded observations, not active vulnerability scans. They do not inspect authenticated behavior, submit forms, crawl routes, or probe payloads. The operator attestation is not proof of target authorization. RevenueGuard is a local-only, single-user learning application and is not production-ready as a hosted multi-user scanner. Active testing of another application would require a separately designed, isolated, explicitly authorized target configuration.
+`npm ci` installs only the development tools used by verification; it is not needed to run the app. The test suite uses synthetic code and injected transports. It does not send requests to an external website.
 
 ## License
 
-No license has been added yet. Public visibility lets people view the repository, but it does not grant permission to reuse or redistribute its code. Add a license if you want to grant those rights.
-
+No license has been added. Public visibility alone does not grant permission to reuse or redistribute this code.

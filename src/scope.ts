@@ -3,7 +3,7 @@ import { posix, win32 } from "node:path";
 import { isIP } from "node:net";
 
 export interface ScopeConfig {
-  readonly mode: "laboratory";
+  readonly mode: "scanner" | "laboratory";
   readonly approvedOrigins: readonly string[];
   readonly approvedPathPrefixes: readonly string[];
   readonly approvedServices: readonly string[];
@@ -21,6 +21,14 @@ export interface ScopeConfig {
     readonly maxResponseBytes?: number;
     readonly maxPublicPages: number;
     readonly maxPublicBytesPerPage: number;
+    readonly maxWebScanRequests?: number;
+    readonly maxWebScanPages?: number;
+    readonly maxWebScanDepth?: number;
+    readonly maxWebScanDurationMs?: number;
+    readonly maxWebScanBytes?: number;
+    readonly maxWebScanResponseBytes?: number;
+    readonly webScanTimeoutMs?: number;
+    readonly webScanDelayMs?: number;
   };
 }
 
@@ -197,8 +205,8 @@ function validatePublicReadOnlyPage(value: unknown, index: number): string {
 
 function validateScopeConfig(value: unknown): asserts value is ScopeConfig {
   const config = asRecord(value, "scope config");
-  if (config.mode !== "laboratory") {
-    fail('scope config mode must be "laboratory"');
+  if (config.mode !== "laboratory" && config.mode !== "scanner") {
+    fail('scope config mode must be "scanner" or the legacy "laboratory"');
   }
 
   if (!Array.isArray(config.approvedOrigins) || config.approvedOrigins.length === 0) {
@@ -227,9 +235,9 @@ function validateScopeConfig(value: unknown): asserts value is ScopeConfig {
   }
 
   const approvedServices = validateStringList(config.approvedServices, "approvedServices");
-  const supportedServices = new Set(["revenueguard-demo", "source-review", "passive-public-review"]);
-  if (!approvedServices.includes("revenueguard-demo") || approvedServices.some((service) => !supportedServices.has(service))) {
-    fail('approvedServices must include "revenueguard-demo" and may include only "source-review" or "passive-public-review"');
+  const supportedServices = new Set(["revenueguard-demo", "source-review", "passive-public-review", "web-scan"]);
+  if (approvedServices.some((service) => !supportedServices.has(service))) {
+    fail('approvedServices may include only "revenueguard-demo", "source-review", "passive-public-review", or "web-scan"');
   }
 
   if (!Array.isArray(config.sourceDirectories) || config.sourceDirectories.length === 0 || config.sourceDirectories.length > 8) {
@@ -273,7 +281,18 @@ function validateScopeConfig(value: unknown): asserts value is ScopeConfig {
   }
 
   const budgets = asRecord(config.budgets, "budgets");
-  const { maxRequestsPerAudit, maxConcurrentAudits, timeoutMs, maxSourceFiles, maxSourceBytes, maxResponseBytes, maxPublicPages, maxPublicBytesPerPage } = budgets;
+  const {
+    maxRequestsPerAudit, maxConcurrentAudits, timeoutMs, maxSourceFiles, maxSourceBytes,
+    maxResponseBytes, maxPublicPages, maxPublicBytesPerPage,
+  } = budgets;
+  const maxWebScanRequests = budgets.maxWebScanRequests ?? 250;
+  const maxWebScanPages = budgets.maxWebScanPages ?? 100;
+  const maxWebScanDepth = budgets.maxWebScanDepth ?? 4;
+  const maxWebScanDurationMs = budgets.maxWebScanDurationMs ?? 180_000;
+  const maxWebScanBytes = budgets.maxWebScanBytes ?? 50_000_000;
+  const maxWebScanResponseBytes = budgets.maxWebScanResponseBytes ?? 2_000_000;
+  const webScanTimeoutMs = budgets.webScanTimeoutMs ?? 10_000;
+  const webScanDelayMs = budgets.webScanDelayMs ?? 100;
   if (!Number.isInteger(maxRequestsPerAudit) || (maxRequestsPerAudit as number) < 0) {
     fail("budgets.maxRequestsPerAudit must be a non-negative integer");
   }
@@ -299,6 +318,30 @@ function validateScopeConfig(value: unknown): asserts value is ScopeConfig {
   if (!Number.isInteger(maxPublicBytesPerPage) || (maxPublicBytesPerPage as number) < 1024 || (maxPublicBytesPerPage as number) > 2_000_000) {
     fail("budgets.maxPublicBytesPerPage must be an integer from 1024 to 2000000");
   }
+  if (!Number.isInteger(maxWebScanRequests) || (maxWebScanRequests as number) < 1 || (maxWebScanRequests as number) > 2000) {
+    fail("budgets.maxWebScanRequests must be an integer from 1 to 2000");
+  }
+  if (!Number.isInteger(maxWebScanPages) || (maxWebScanPages as number) < 1 || (maxWebScanPages as number) > 500) {
+    fail("budgets.maxWebScanPages must be an integer from 1 to 500");
+  }
+  if (!Number.isInteger(maxWebScanDepth) || (maxWebScanDepth as number) < 0 || (maxWebScanDepth as number) > 8) {
+    fail("budgets.maxWebScanDepth must be an integer from 0 to 8");
+  }
+  if (!Number.isInteger(maxWebScanDurationMs) || (maxWebScanDurationMs as number) < 1000 || (maxWebScanDurationMs as number) > 300_000) {
+    fail("budgets.maxWebScanDurationMs must be an integer from 1000 to 300000");
+  }
+  if (!Number.isInteger(maxWebScanBytes) || (maxWebScanBytes as number) < 1024 || (maxWebScanBytes as number) > 500_000_000) {
+    fail("budgets.maxWebScanBytes must be an integer from 1024 to 500000000");
+  }
+  if (!Number.isInteger(maxWebScanResponseBytes) || (maxWebScanResponseBytes as number) < 1024 || (maxWebScanResponseBytes as number) > 2_000_000) {
+    fail("budgets.maxWebScanResponseBytes must be an integer from 1024 to 2000000");
+  }
+  if (!Number.isInteger(webScanTimeoutMs) || (webScanTimeoutMs as number) < 1000 || (webScanTimeoutMs as number) > 30_000) {
+    fail("budgets.webScanTimeoutMs must be an integer from 1000 to 30000");
+  }
+  if (!Number.isInteger(webScanDelayMs) || (webScanDelayMs as number) < 0 || (webScanDelayMs as number) > 5000) {
+    fail("budgets.webScanDelayMs must be an integer from 0 to 5000");
+  }
 }
 
 function originKeys(config: ScopeConfig): Set<string> {
@@ -309,6 +352,12 @@ function migrateScopeConfig(value: unknown): unknown {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
   const original = value as Record<string, unknown>;
   const migrated: Record<string, unknown> = { ...original };
+  if (original.mode === "laboratory") migrated.mode = "scanner";
+  if (original.mode === "laboratory" && Array.isArray(original.approvedServices) && !original.approvedServices.includes("web-scan")) {
+    // The new scanner is a local feature. No target is selected, contacted, or
+    // authorized by this migration; every web scan still needs per-run consent.
+    migrated.approvedServices = [...original.approvedServices, "web-scan"];
+  }
   if (!Array.isArray(original.publicReadOnlyPages)) migrated.publicReadOnlyPages = [];
   if (original.budgets && typeof original.budgets === "object" && !Array.isArray(original.budgets)) {
     const budgets = original.budgets as Record<string, unknown>;
@@ -319,12 +368,20 @@ function migrateScopeConfig(value: unknown): unknown {
       maxResponseBytes: budgets.maxResponseBytes ?? 2_000_000,
       maxPublicPages: budgets.maxPublicPages ?? 4,
       maxPublicBytesPerPage: budgets.maxPublicBytesPerPage ?? 1_000_000,
+      maxWebScanRequests: budgets.maxWebScanRequests ?? 250,
+      maxWebScanPages: budgets.maxWebScanPages ?? 100,
+      maxWebScanDepth: budgets.maxWebScanDepth ?? 4,
+      maxWebScanDurationMs: budgets.maxWebScanDurationMs ?? 180_000,
+      maxWebScanBytes: budgets.maxWebScanBytes ?? 50_000_000,
+      maxWebScanResponseBytes: budgets.maxWebScanResponseBytes ?? 2_000_000,
+      webScanTimeoutMs: budgets.webScanTimeoutMs ?? 10_000,
+      webScanDelayMs: budgets.webScanDelayMs ?? 100,
     };
   }
   return migrated;
 }
 
-/** Read and validate the laboratory-only scope config from a JSON file. */
+/** Read and validate local scanner scope from a JSON file. */
 export function loadScopeConfig(configPath: string): ScopeConfig {
   if (typeof configPath !== "string" || configPath.length === 0) {
     fail("configPath must be a non-empty path string");
@@ -341,7 +398,7 @@ export function loadScopeConfig(configPath: string): ScopeConfig {
 
   // Copy and freeze the security-relevant fields so later mutation cannot widen scope.
   const config = Object.freeze({
-    mode: "laboratory" as const,
+    mode: parsed.mode,
     approvedOrigins: Object.freeze([...parsed.approvedOrigins]),
     approvedPathPrefixes: Object.freeze([...parsed.approvedPathPrefixes]),
     approvedServices: Object.freeze([...parsed.approvedServices]),
@@ -359,6 +416,14 @@ export function loadScopeConfig(configPath: string): ScopeConfig {
       maxResponseBytes: parsed.budgets.maxResponseBytes,
       maxPublicPages: parsed.budgets.maxPublicPages,
       maxPublicBytesPerPage: parsed.budgets.maxPublicBytesPerPage,
+      maxWebScanRequests: parsed.budgets.maxWebScanRequests,
+      maxWebScanPages: parsed.budgets.maxWebScanPages,
+      maxWebScanDepth: parsed.budgets.maxWebScanDepth,
+      maxWebScanDurationMs: parsed.budgets.maxWebScanDurationMs,
+      maxWebScanBytes: parsed.budgets.maxWebScanBytes,
+      maxWebScanResponseBytes: parsed.budgets.maxWebScanResponseBytes,
+      webScanTimeoutMs: parsed.budgets.webScanTimeoutMs,
+      webScanDelayMs: parsed.budgets.webScanDelayMs,
     }),
   });
   requestCounts.set(config, 0);

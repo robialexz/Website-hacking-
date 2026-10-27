@@ -14,9 +14,11 @@ import type { ScopeConfig } from "./scope.ts";
 import { executeSourceReview } from "./source-review.ts";
 import { executePublicReview } from "./public-review.ts";
 import { executePostureReview, POSTURE_REVIEW_MAX_PAGES } from "./posture-review.ts";
+import { executeWebScan, parseWebScanTarget, scannerBudgetSummary } from "./web-scan.ts";
 
 const HOST = "127.0.0.1";
-const PORT = 8765;
+const PORT = process.env.REVENUEGUARD_PORT === undefined ? 8765 : Number(process.env.REVENUEGUARD_PORT);
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error("REVENUEGUARD_PORT must be a TCP port from 1 to 65535.");
 const ORIGIN = `http://${HOST}:${PORT}`;
 const ROOT = process.cwd();
 const DATA_DIR = resolve(ROOT, "data");
@@ -26,8 +28,9 @@ const PUBLIC_DIR = resolve(ROOT, "public");
 const DB_PATH = resolve(DATA_DIR, "revenueguard.sqlite");
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_QUEUED_JOBS = 6;
-const CHECK_COUNT = 7;
+const CHECK_COUNT = 10;
 const POSTURE_ATTESTATION_VERSION = 1;
+const WEB_SCAN_ATTESTATION_VERSION = 2;
 type ReportRequestStatus = "not-sent" | "unknown" | "response-received";
 type ReportCoverageItem = CoverageItem & { requestStatus?: ReportRequestStatus };
 
@@ -104,11 +107,77 @@ if (!jobColumns.some((column) => column.name === "attestation_json")) {
   db.exec("ALTER TABLE jobs ADD COLUMN attestation_json TEXT NOT NULL DEFAULT '{}'");
 }
 
+// Remove full target paths written by older web-scan builds from local history.
+const privacyMigration = db.prepare("SELECT value FROM settings WHERE key = 'web_scan_path_privacy_v1'").get() as { value?: string } | undefined;
+if (privacyMigration?.value !== "1") {
+const historicalWebScanJobs = db.prepare("SELECT id, target_pages_json, attestation_json, scope_json FROM jobs WHERE action = 'web-scan'").all() as Array<Record<string, unknown>>;
+for (const row of historicalWebScanJobs) {
+  const rawTargets = safeJson(String(row.target_pages_json ?? "[]"), []);
+  const rawAttestation = safeJson(String(row.attestation_json ?? "{}"), {});
+  const rawScope = safeJson(String(row.scope_json ?? "{}"), {});
+  const attestation = rawAttestation && typeof rawAttestation === "object" && !Array.isArray(rawAttestation)
+    ? { ...rawAttestation as Record<string, unknown> }
+    : {};
+  const savedScope = rawScope && typeof rawScope === "object" && !Array.isArray(rawScope)
+    ? { ...rawScope as Record<string, unknown> }
+    : {};
+  const possibleOrigins = [attestation.origin, attestation.target, savedScope.webScanTarget, ...(Array.isArray(rawTargets) ? rawTargets : [])];
+  let origin: string | undefined;
+  for (const value of possibleOrigins) {
+    if (typeof value !== "string") continue;
+    try {
+      const parsed = new URL(value);
+      if (parsed.protocol === "https:" && !parsed.username && !parsed.password) { origin = parsed.origin; break; }
+    } catch { /* A malformed old target is not used for migration. */ }
+  }
+  if (typeof row.id !== "string") continue;
+  delete attestation.target;
+  if (origin) {
+    attestation.origin = origin;
+    savedScope.webScanTarget = origin;
+  } else {
+    delete attestation.origin;
+    delete savedScope.webScanTarget;
+  }
+  db.prepare("UPDATE jobs SET target_pages_json = ?, attestation_json = ?, scope_json = ?, coverage_json = ?, error = NULL WHERE id = ?")
+    .run(JSON.stringify(origin ? [origin] : []), JSON.stringify(attestation), JSON.stringify(savedScope),
+      JSON.stringify([{ key: "web.history.sanitized", label: "Legacy scan coverage", attempted: false, status: "NOT TESTED", details: "Per-route coverage from a previous build was removed while sanitizing saved paths." }]), String(row.id));
+  db.prepare("UPDATE execution_logs SET message = ? WHERE job_id = ?")
+    .run("Legacy web-scan log details were removed while sanitizing saved paths.", String(row.id));
+  const findings = db.prepare("SELECT id, actual FROM findings WHERE job_id = ?").all(String(row.id)) as Array<Record<string, unknown>>;
+  for (const finding of findings) {
+    const observedCount = /Observed on (\d+) page\(s\)\./.exec(String(finding.actual ?? ""))?.[1] || "1";
+    const evidence = {
+      webScan: { pageCount: Number(observedCount), samplePaths: [], checks: {} },
+      note: "Aggregate observations only; web-scan paths were omitted from local history.",
+    };
+    const reproduction = [
+      "Review the aggregate observation in the technical report; route paths are omitted.",
+      "Validate behavior in the application's own test environment before changing policy.",
+    ];
+    db.prepare("UPDATE findings SET target = ?, endpoint = ?, actual = ?, evidence_json = ?, reproduction_json = ? WHERE id = ?")
+      .run(origin || "unknown target", origin || "unknown target", `Observed on ${observedCount} page(s). Sample paths omitted for privacy.`, JSON.stringify(evidence), JSON.stringify(reproduction), String(finding.id));
+  }
+}
+db.prepare("INSERT INTO settings(key, value) VALUES('web_scan_path_privacy_v1', '1') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
+}
+
 const savedProfile = db.prepare("SELECT value FROM settings WHERE key = 'lab_profile'").get() as { value?: string } | undefined;
 let currentProfile: LabProfile = savedProfile?.value === "secure" ? "secure" : "vulnerable";
 let labState = createLabState();
 let csrfToken = randomBytes(24).toString("hex");
 let workerRunning = false;
+const activeJobControllers = new Map<string, AbortController>();
+const pendingWebScanTargets = new Map<string, string>();
+let shuttingDown = false;
+let httpServerClosed = false;
+let databaseClosed = false;
+function closeDatabaseWhenIdle(): void {
+  if (shuttingDown && httpServerClosed && !workerRunning && !databaseClosed) {
+    databaseClosed = true;
+    db.close();
+  }
+}
 
 function now(): string {
   return new Date().toISOString();
@@ -124,10 +193,10 @@ function addLog(jobId: string, level: string, message: string): void {
     .run(jobId, now(), level, message.slice(0, 500));
 }
 
-const interruptedJobs = db.prepare("SELECT id FROM jobs WHERE status IN ('queued', 'running')").all() as Array<{ id?: string }>;
+const interruptedJobs = db.prepare("SELECT id FROM jobs WHERE status IN ('queued', 'running', 'cancelling')").all() as Array<{ id?: string }>;
 if (interruptedJobs.length) {
   const finishedAt = now();
-  db.prepare("UPDATE jobs SET status = 'failed', finished_at = ?, error = ? WHERE status IN ('queued', 'running')")
+  db.prepare("UPDATE jobs SET status = 'failed', finished_at = ?, error = ? WHERE status IN ('queued', 'running', 'cancelling')")
     .run(finishedAt, "Stopped on app restart; start a new run to confirm the current scope.");
   for (const job of interruptedJobs) {
     if (job.id) addLog(job.id, "warning", "This queued or interrupted run was not replayed after restart. Start a new run explicitly.");
@@ -233,6 +302,22 @@ function rowToFinding(row: Record<string, unknown>): Record<string, unknown> {
 
 function rowToJob(row: Record<string, unknown>): Record<string, unknown> {
   const action = String(row.action);
+  const parsedAttestation = safeJson(String(row.attestation_json ?? "{}"), {});
+  const savedAttestation = parsedAttestation && typeof parsedAttestation === "object" && !Array.isArray(parsedAttestation)
+    ? parsedAttestation as Record<string, unknown>
+    : {};
+  const targetOrigin = typeof savedAttestation.origin === "string" ? savedAttestation.origin : undefined;
+  const authorizationAttestation = action === "web-scan" ? {
+    version: savedAttestation.version,
+    attestedAt: savedAttestation.attestedAt,
+    authorized: savedAttestation.authorized === true,
+    safeGet: savedAttestation.safeGet === true,
+    origin: targetOrigin,
+    maxPages: savedAttestation.maxPages,
+    maxDepth: savedAttestation.maxDepth,
+    statement: savedAttestation.statement,
+  } : savedAttestation;
+  const savedTargets = safeJson(String(row.target_pages_json ?? "[]"), []);
   return {
     id: row.id,
     action,
@@ -240,6 +325,7 @@ function rowToJob(row: Record<string, unknown>): Record<string, unknown> {
       : action === "source-review" ? "Approved source review"
       : action === "public-review" ? "Passive public page review"
       : action === "posture-review" ? "HTTPS posture observations"
+      : action === "web-scan" ? "Web security scan"
       : "Local security audit",
     profile: row.profile,
     status: row.status,
@@ -248,8 +334,9 @@ function rowToJob(row: Record<string, unknown>): Record<string, unknown> {
     finishedAt: row.finished_at,
     error: row.error,
     coverage: safeJson(String(row.coverage_json), []),
-    targetPages: safeJson(String(row.target_pages_json ?? "[]"), []),
-    authorizationAttestation: safeJson(String(row.attestation_json ?? "{}"), {}),
+    targetPages: action === "web-scan" ? (targetOrigin ? [targetOrigin] : []) : savedTargets,
+    targetOrigin,
+    authorizationAttestation,
   };
 }
 
@@ -281,6 +368,37 @@ function postureTargetsForJob(row: Record<string, unknown>): string[] {
   return pages;
 }
 
+function webScanRequestForJob(row: Record<string, unknown>): { target: URL; maxPages: number; maxDepth: number } {
+  const rawTargets = safeJson(String(row.target_pages_json ?? "[]"), []);
+  const rawAttestation = safeJson(String(row.attestation_json ?? "{}"), {});
+  if (!Array.isArray(rawTargets) || rawTargets.length !== 1 || typeof rawTargets[0] !== "string") {
+    throw new Error("The saved web scan target is missing or invalid.");
+  }
+  if (!rawAttestation || typeof rawAttestation !== "object" || Array.isArray(rawAttestation)) {
+    throw new Error("The saved web scan authorization attestation is invalid.");
+  }
+  const attestation = rawAttestation as Record<string, unknown>;
+  const pendingTarget = pendingWebScanTargets.get(String(row.id));
+  if (!pendingTarget) throw new Error("The exact target is available only in memory; queued runs are not resumed after restart.");
+  const target = parseWebScanTarget(pendingTarget);
+  const budgets = scannerBudgetSummary(scope);
+  const maxPages = attestation.maxPages;
+  const maxDepth = attestation.maxDepth;
+  if (
+    attestation.version !== WEB_SCAN_ATTESTATION_VERSION ||
+    attestation.authorized !== true ||
+    attestation.safeGet !== true ||
+    attestation.origin !== target.origin ||
+    rawTargets[0] !== target.origin ||
+    typeof attestation.attestedAt !== "string" ||
+    !Number.isInteger(maxPages) || Number(maxPages) < 1 || Number(maxPages) > budgets.maxPages ||
+    !Number.isInteger(maxDepth) || Number(maxDepth) < 0 || Number(maxDepth) > budgets.maxDepth
+  ) {
+    throw new Error("The saved web scan attestation does not match the target or active budgets.");
+  }
+  return { target, maxPages: Number(maxPages), maxDepth: Number(maxDepth) };
+}
+
 function storeFinding(jobId: string, finding: AuditFinding): void {
   db.prepare(`INSERT INTO findings(
     id, job_id, finding_key, title, category, severity, status, confidence, target,
@@ -296,9 +414,12 @@ function storeFinding(jobId: string, finding: AuditFinding): void {
 
 function storeResult(jobId: string, action: string, profile: LabProfile, result: AuditResult): void {
   const resultKeys = new Set(result.findings.map((finding) => finding.key));
-  const verifiedStatuses = new Map<string, "CONFIRMED" | "SUSPECTED">(result.coverage
-    .filter((item) => item.controlVerified && (item.status === "CONFIRMED" || item.status === "SUSPECTED"))
-    .map((item) => [item.key, item.status] as const));
+  const verifiedStatuses = new Map<string, "CONFIRMED" | "SUSPECTED">();
+  for (const item of result.coverage) {
+    if (item.controlVerified && (item.status === "CONFIRMED" || item.status === "SUSPECTED")) {
+      verifiedStatuses.set(item.key, item.status);
+    }
+  }
   const retestFindings = result.findings.map((finding) => {
     if (action !== "retest" || profile !== "secure" || verifiedStatuses.get(finding.key) !== finding.status) return finding;
     const state = finding.status === "CONFIRMED" ? "Still reproduces" : "Still present as suspected";
@@ -324,13 +445,14 @@ function storeResult(jobId: string, action: string, profile: LabProfile, result:
       for (const row of previous) {
         if (!resultKeys.has(String(row.finding_key))) {
           db.prepare("UPDATE findings SET status = 'FIXED AND RETESTED', retest_status = ? WHERE id = ?")
-            .run(`Not reproduced against secure demo profile in run ${jobId}`, row.id);
+            .run(`Not reproduced against secure demo profile in run ${jobId}`, String(row.id));
         }
       }
     }
 
-    db.prepare("UPDATE jobs SET status = 'complete', finished_at = ?, coverage_json = ? WHERE id = ?")
-      .run(now(), JSON.stringify(result.coverage), jobId);
+    db.prepare("UPDATE jobs SET status = ?, finished_at = ?, coverage_json = ?, error = ? WHERE id = ?")
+      .run(result.cancelled ? "cancelled" : "complete", now(), JSON.stringify(result.coverage),
+        result.cancelled ? "Stopped by operator; remaining routes were not requested." : null, jobId);
     db.exec("COMMIT;");
   } catch (error) {
     db.exec("ROLLBACK;");
@@ -340,10 +462,11 @@ function storeResult(jobId: string, action: string, profile: LabProfile, result:
 
 async function runJob(jobId: string): Promise<void> {
   const row = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId) as Record<string, unknown> | undefined;
-  if (!row) return;
+  if (!row) { pendingWebScanTargets.delete(jobId); return; }
   const action = String(row.action);
   const profile = row.profile === "secure" ? "secure" : "vulnerable";
   let posturePages: string[] = [];
+  let webScanRequest: { target: URL; maxPages: number; maxDepth: number } | undefined;
   if (action === "posture-review") {
     try {
       posturePages = postureTargetsForJob(row);
@@ -354,15 +477,31 @@ async function runJob(jobId: string): Promise<void> {
       return;
     }
   }
+  if (action === "web-scan") {
+    try {
+      webScanRequest = webScanRequestForJob(row);
+    } catch (error) {
+      db.prepare("UPDATE jobs SET status = 'failed', finished_at = ?, error = ? WHERE id = ?")
+        .run(now(), "Saved web scan authorization or target scope is invalid; no request was sent.", jobId);
+      addLog(jobId, "warning", error instanceof Error ? error.message : "Saved web scan target is invalid.");
+      pendingWebScanTargets.delete(jobId);
+      return;
+    }
+  }
   const jobScopeSnapshot = action === "posture-review"
     ? { ...scope, publicReadOnlyPages: posturePages }
+    : action === "web-scan" && webScanRequest
+      ? { ...scope, webScanTarget: webScanRequest.target.origin }
     : scope;
   if (typeof row.scope_json !== "string" || row.scope_json !== JSON.stringify(jobScopeSnapshot)) {
     db.prepare("UPDATE jobs SET status = 'failed', finished_at = ?, error = ? WHERE id = ?")
       .run(now(), "Approved scope changed; start a new run against the current scope.", jobId);
     addLog(jobId, "warning", "Run stopped because its saved scope does not match the active approved scope.");
+    pendingWebScanTargets.delete(jobId);
     return;
   }
+  const controller = new AbortController();
+  activeJobControllers.set(jobId, controller);
   db.prepare("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?").run(now(), jobId);
   addLog(jobId, "info", action === "source-review"
     ? `Started a read-only static review of approved source directories: ${scope.sourceDirectories.map(sourceDirectoryLabel).join(", ")}.`
@@ -370,6 +509,8 @@ async function runJob(jobId: string): Promise<void> {
       ? `Started a passive review of ${scope.publicReadOnlyPages.length} exact HTTPS page(s); one GET per page, no redirects or page assets.`
       : action === "posture-review"
         ? `Started bounded HTTPS posture observations for the exact page snapshot; one unauthenticated GET per page, no redirects or crawling.`
+      : action === "web-scan" && webScanRequest
+        ? `Started an authorized same-origin web scan for ${webScanRequest.target.origin}; up to ${webScanRequest.maxPages} pages and depth ${webScanRequest.maxDepth}, with no credentials or exploit payloads.`
       : `Started ${action} against the local synthetic demo (${profile} profile).`);
   try {
     const jobScope = scope;
@@ -379,6 +520,8 @@ async function runJob(jobId: string): Promise<void> {
         ? await executePublicReview({ scope: jobScope })
         : action === "posture-review"
           ? await executePostureReview({ scope: jobScope, pages: posturePages })
+          : action === "web-scan" && webScanRequest
+            ? await executeWebScan({ scope: jobScope, target: webScanRequest.target, maxPages: webScanRequest.maxPages, maxDepth: webScanRequest.maxDepth, signal: controller.signal })
         : await executeAudit({ scope: jobScope, targetLabel: "RevenueGuard local demo" });
     storeResult(jobId, action, profile, result);
     const confirmed = result.findings.filter((finding) => finding.status === "CONFIRMED").length;
@@ -387,9 +530,13 @@ async function runJob(jobId: string): Promise<void> {
     const attempted = result.coverage.filter((item) => item.attempted).length;
     addLog(jobId, "info", `Recorded ${attempted}/${result.coverage.length} attempted checks: ${confirmed} confirmed, ${suspected} suspected, ${observed} informational observation(s). Coverage is not a site-wide security verdict.`);
   } catch (error) {
-    db.prepare("UPDATE jobs SET status = 'failed', finished_at = ?, error = ? WHERE id = ?")
-      .run(now(), "Audit failed. Review the local execution log.", jobId);
-    addLog(jobId, "error", error instanceof Error ? error.message : "Audit failed");
+    const cancelled = action === "web-scan" && controller.signal.aborted;
+    db.prepare("UPDATE jobs SET status = ?, finished_at = ?, error = ? WHERE id = ?")
+      .run(cancelled ? "cancelled" : "failed", now(), cancelled ? "Stopped by operator." : "Audit failed. Review the local execution log.", jobId);
+    addLog(jobId, cancelled ? "warning" : "error", cancelled ? "Run cancelled by operator." : error instanceof Error ? error.message : "Audit failed");
+  } finally {
+    activeJobControllers.delete(jobId);
+    pendingWebScanTargets.delete(jobId);
   }
 }
 
@@ -398,21 +545,24 @@ async function drainQueue(): Promise<void> {
   workerRunning = true;
   try {
     while (true) {
+      if (shuttingDown) break;
       const row = db.prepare("SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1").get() as { id?: string } | undefined;
       if (!row?.id) break;
       await runJob(row.id);
     }
   } finally {
     workerRunning = false;
+    closeDatabaseWhenIdle();
   }
 }
 
 function enqueueJob(
-  action: "audit" | "retest" | "source-review" | "public-review" | "posture-review",
+  action: "audit" | "retest" | "source-review" | "public-review" | "posture-review" | "web-scan",
   confirmPublicGet = false,
-  postureRequest?: { pages?: unknown; authorizationAttestation?: unknown },
+  postureRequest?: { pages?: unknown; target?: unknown; maxPages?: unknown; maxDepth?: unknown; authorizationAttestation?: unknown },
 ): Record<string, unknown> {
-  const active = db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE status IN ('queued', 'running')").get() as { count?: number };
+  if (shuttingDown) throw new Error("RevenueGuard is shutting down and cannot accept new runs.");
+  const active = db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE status IN ('queued', 'running', 'cancelling')").get() as { count?: number };
   if (Number(active.count || 0) >= MAX_QUEUED_JOBS) throw new Error("The local queue is full. Wait for a run to finish.");
   if (action === "retest" && currentProfile !== "secure") throw new Error("Switch the demo profile to Secure controls before retesting.");
   if ((action === "audit" || action === "retest") && !scope.approvedServices.includes("revenueguard-demo")) throw new Error("Enable revenueguard-demo in approvedServices before starting a local audit.");
@@ -449,6 +599,35 @@ function enqueueJob(
       throw new Error("Complete both authorization and safe-GET attestations before starting.");
     }
   }
+  let webScanTarget: URL | undefined;
+  let webScanMaxPages = 0;
+  let webScanMaxDepth = 0;
+  if (action === "web-scan") {
+    if (!scope.approvedServices.includes("web-scan")) throw new Error("Enable web-scan in the local scanner scope before starting a web scan.");
+    if (typeof postureRequest?.target !== "string") throw new Error("Enter one HTTPS target URL.");
+    webScanTarget = parseWebScanTarget(postureRequest.target);
+    const limits = scannerBudgetSummary(scope);
+    webScanMaxPages = postureRequest.maxPages === undefined ? Math.min(100, limits.maxPages) : Number(postureRequest.maxPages);
+    webScanMaxDepth = postureRequest.maxDepth === undefined ? limits.maxDepth : Number(postureRequest.maxDepth);
+    if (!Number.isInteger(webScanMaxPages) || webScanMaxPages < 1 || webScanMaxPages > limits.maxPages) {
+      throw new Error("Choose a page limit within the configured scanner budget.");
+    }
+    if (!Number.isInteger(webScanMaxDepth) || webScanMaxDepth < 0 || webScanMaxDepth > limits.maxDepth) {
+      throw new Error("Choose a crawl depth within the configured scanner budget.");
+    }
+    const rawAttestation = postureRequest.authorizationAttestation;
+    if (!rawAttestation || typeof rawAttestation !== "object" || Array.isArray(rawAttestation)) {
+      throw new Error("Confirm authorization and safe unauthenticated GET requests before starting.");
+    }
+    const attestation = rawAttestation as Record<string, unknown>;
+    if (
+      attestation.authorized !== true || attestation.safeGet !== true ||
+      attestation.version !== WEB_SCAN_ATTESTATION_VERSION ||
+      attestation.target !== webScanTarget.href || attestation.origin !== webScanTarget.origin ||
+      attestation.maxPages !== webScanMaxPages || attestation.maxDepth !== webScanMaxDepth
+    ) throw new Error("Confirm authorization and safe unauthenticated GET requests for this exact target and budget before starting.");
+    targetPages = [webScanTarget.origin];
+  }
   const id = randomUUID();
   const createdAt = now();
   if (action === "public-review") {
@@ -470,29 +649,83 @@ function enqueueJob(
       pages: [...targetPages],
       statement: "I attest that I am authorized to request these exact URLs for this run. I attest that one unauthenticated GET to each selected route is safe, and understand GET requests may still trigger site actions.",
     };
+  } else if (action === "web-scan" && webScanTarget) {
+    attestationSnapshot = {
+      version: WEB_SCAN_ATTESTATION_VERSION,
+      attestedAt: createdAt,
+      authorized: true,
+      safeGet: true,
+      origin: webScanTarget.origin,
+      maxPages: webScanMaxPages,
+      maxDepth: webScanMaxDepth,
+      statement: "I own this target or have permission to test it. I understand the scan uses unauthenticated same-origin HTTPS GET requests, excludes obvious action-like routes, and may still encounter GET routes with side effects.",
+    };
   }
   const profile = action === "source-review" ? "approved-source"
     : action === "public-review" ? "approved-public"
     : action === "posture-review" ? "approved-posture"
+    : action === "web-scan" ? "web-baseline"
     : currentProfile;
   const scopeSnapshot = action === "posture-review"
     ? { ...scope, publicReadOnlyPages: [...targetPages] }
+    : action === "web-scan" && webScanTarget
+      ? { ...scope, webScanTarget: webScanTarget.origin }
     : scope;
   db.prepare("INSERT INTO jobs(id, action, profile, status, created_at, coverage_json, scope_json, target_pages_json, attestation_json) VALUES(?, ?, ?, 'queued', ?, '[]', ?, ?, ?)")
     .run(id, action, profile, createdAt, JSON.stringify(scopeSnapshot), JSON.stringify(targetPages), JSON.stringify(attestationSnapshot));
+  if (action === "web-scan" && webScanTarget) pendingWebScanTargets.set(id, webScanTarget.href);
   addLog(id, "info", action === "source-review" ? "Queued static review of approved local source files."
     : action === "public-review" ? `Queued passive GET review of ${scope.publicReadOnlyPages.length} exact HTTPS page(s).`
     : action === "posture-review" ? `Queued posture observations for ${targetPages.length} exact HTTPS page(s) after recording the per-run operator attestation.`
+    : action === "web-scan" && webScanTarget ? `Queued same-origin web scan for ${webScanTarget.origin}; authorization and request limits saved for this run.`
     : `Queued ${action} in ${profile} profile.`);
   setImmediate(() => { void drainQueue(); });
-  return { id, action, profile, status: "queued", createdAt };
+  return { id, action, profile, status: "queued", createdAt, ...(webScanTarget ? { target: webScanTarget.origin, maxPages: webScanMaxPages, maxDepth: webScanMaxDepth } : {}) };
+}
+
+function cancelJob(jobId: string): { status: string } {
+  const row = db.prepare("SELECT action, status FROM jobs WHERE id = ?").get(jobId) as { action?: string; status?: string } | undefined;
+  if (!row) throw new Error("Scan run not found.");
+  if (row.status === "queued") {
+    db.prepare("UPDATE jobs SET status = 'cancelled', finished_at = ?, error = ? WHERE id = ? AND status = 'queued'")
+      .run(now(), "Cancelled before the worker started; no request was sent.", jobId);
+    addLog(jobId, "warning", "Cancelled before the worker started; no request was sent.");
+    pendingWebScanTargets.delete(jobId);
+    return { status: "cancelled" };
+  }
+  if (row.status === "running") {
+    if (row.action !== "web-scan") throw new Error("Only active web scans can be stopped; other review types run to completion.");
+    const controller = activeJobControllers.get(jobId);
+    if (!controller) {
+      db.prepare("UPDATE jobs SET status = 'failed', finished_at = ?, error = ? WHERE id = ? AND status = 'running'")
+        .run(now(), "The active web scan could not be interrupted safely; no further pages will be started.", jobId);
+      addLog(jobId, "error", "The scan had no active cancellation controller and was marked failed.");
+      return { status: "failed" };
+    }
+    db.prepare("UPDATE jobs SET status = 'cancelling' WHERE id = ? AND status = 'running'").run(jobId);
+    controller.abort();
+    addLog(jobId, "warning", "Cancellation requested; the active request is being stopped.");
+    return { status: "cancelling" };
+  }
+  if (row.status === "cancelling" || row.status === "cancelled") return { status: row.status };
+  throw new Error("This run has already finished and cannot be cancelled.");
+}
+
+function beginShutdown(): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  db.prepare("UPDATE jobs SET status = 'cancelled', finished_at = ?, error = ? WHERE status = 'queued'")
+    .run(now(), "Cancelled during application shutdown before the worker started; no request was sent.");
+  pendingWebScanTargets.clear();
+  for (const controller of activeJobControllers.values()) controller.abort();
+  closeDatabaseWhenIdle();
 }
 
 function dashboardData(): Record<string, unknown> {
   const jobs = db.prepare("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 8").all() as Array<Record<string, unknown>>;
   const latest = db.prepare("SELECT id, coverage_json FROM jobs WHERE status = 'complete' ORDER BY created_at DESC LIMIT 1").get() as Record<string, unknown> | undefined;
   const findings = latest
-    ? db.prepare("SELECT * FROM findings WHERE job_id = ? ORDER BY created_at DESC LIMIT 24").all(latest.id) as Array<Record<string, unknown>>
+    ? db.prepare("SELECT * FROM findings WHERE job_id = ? ORDER BY created_at DESC LIMIT 24").all(String(latest.id)) as Array<Record<string, unknown>>
     : [];
   const counts = latest
     ? db.prepare(`SELECT
@@ -500,7 +733,7 @@ function dashboardData(): Record<string, unknown> {
         SUM(CASE WHEN status = 'SUSPECTED' THEN 1 ELSE 0 END) AS suspected,
         SUM(CASE WHEN status = 'OBSERVED' THEN 1 ELSE 0 END) AS observed,
         COUNT(*) AS total
-        FROM findings WHERE job_id = ?`).get(latest.id) as Record<string, unknown>
+        FROM findings WHERE job_id = ?`).get(String(latest.id)) as Record<string, unknown>
     : { confirmed: 0, suspected: 0, observed: 0, total: 0 };
   const jobCount = db.prepare("SELECT COUNT(*) AS count FROM jobs").get() as { count?: number };
   const coverage = latest ? safeJson(String(latest.coverage_json), []) as CoverageItem[] : [];
@@ -532,6 +765,11 @@ function dashboardData(): Record<string, unknown> {
       maxSourceBytes: scope.budgets.maxSourceBytes,
       maxPublicPages: scope.budgets.maxPublicPages,
       maxPublicBytesPerPage: scope.budgets.maxPublicBytesPerPage,
+      webScanAvailable: scope.approvedServices.includes("web-scan"),
+      webScanBudgets: scannerBudgetSummary(scope),
+      webScanResponseBytes: scope.budgets.maxWebScanResponseBytes,
+      webScanTimeoutMs: scope.budgets.webScanTimeoutMs,
+      webScanDelayMs: scope.budgets.webScanDelayMs,
     },
     jobs: jobs.map(rowToJob),
     findings: findings.map(rowToFinding),
@@ -571,8 +809,10 @@ function reportHtml(kind: string, data: NonNullable<ReturnType<typeof reportsFor
   const sourceReview = job.action === "source-review";
   const publicReview = job.action === "public-review";
   const postureReview = job.action === "posture-review";
+  const webScan = job.action === "web-scan";
+  const webScanOrigin = typeof scopeSnapshot.webScanTarget === "string" ? scopeSnapshot.webScanTarget : "unknown target";
   const coverage = Array.isArray(job.coverage) ? job.coverage as ReportCoverageItem[] : [];
-  const publicPages = Array.isArray(scopeSnapshot.publicReadOnlyPages)
+  const publicPages = (publicReview || postureReview) && Array.isArray(scopeSnapshot.publicReadOnlyPages)
     ? scopeSnapshot.publicReadOnlyPages.filter((page): page is string => typeof page === "string")
     : [];
   const jobStatus = String(job.status || "unknown").toLowerCase();
@@ -609,14 +849,20 @@ function reportHtml(kind: string, data: NonNullable<ReturnType<typeof reportsFor
       ? "This run is in progress; per-page request delivery is not final."
       : jobStatus === "failed"
         ? "This run failed; review the per-page request statuses and execution log."
+        : jobStatus === "cancelled" ? "This run was cancelled; remaining routes were not requested."
+        : jobStatus === "cancelling" ? "Cancellation is in progress; the active request is being stopped."
         : jobStatus === "complete" ? "This run is complete." : "Run status is unavailable.";
-  const requestDeliverySummary = publicPages.length
-    ? `${responseReceivedCount} of ${publicPages.length} target page(s) returned an HTTP response; ${notSentCount} were not sent; ${unknownCount} request outcome(s) are unknown.`
-    : "No exact HTTPS target pages were saved for this run.";
+  const requestDeliverySummary = webScan
+    ? `Target origin: ${webScanOrigin}. Per-route delivery and skipped-link counts appear in coverage.`
+    : publicPages.length
+      ? `${responseReceivedCount} of ${publicPages.length} target page(s) returned an HTTP response; ${notSentCount} were not sent; ${unknownCount} request outcome(s) are unknown.`
+      : "No exact HTTPS target pages were saved for this run.";
   const confirmed = findings.filter((finding) => finding.status === "CONFIRMED");
   const suspected = findings.filter((finding) => finding.status === "SUSPECTED");
   const observations = findings.filter((finding) => finding.status === "OBSERVED");
-  const title = postureReview
+  const title = webScan
+    ? kind === "executive" ? "Web security scan summary" : kind === "remediation" ? "Web scan remediation notes" : "Web security scan evidence"
+    : postureReview
     ? kind === "executive" ? "HTTPS posture observation summary" : kind === "remediation" ? "HTTPS posture review notes" : "HTTPS posture observation evidence"
     : publicReview
     ? kind === "executive" ? "Public page review summary" : kind === "remediation" ? "Page improvement notes" : "Public page review evidence"
@@ -624,7 +870,9 @@ function reportHtml(kind: string, data: NonNullable<ReturnType<typeof reportsFor
       ? kind === "executive" ? "Source review summary" : kind === "remediation" ? "Source remediation notes" : "Source review evidence"
       : kind === "executive" ? "Executive summary" : kind === "remediation" ? "Remediation and retest" : "Technical evidence";
   const summary = kind === "executive"
-    ? postureReview
+    ? webScan
+      ? `<p>${escapeHtml(runStatusNote)} ${escapeHtml(requestDeliverySummary)} This baseline scan requests only unauthenticated same-origin HTTPS pages. It checks selected response headers, cookie attributes, CORS wildcard observations, software banners, mixed content, form destinations, and third-party integrity markers. It does not log in, submit forms, follow redirects, test injection or access control, or prove the site is secure.</p><p><b>${suspected.length}</b> suspected observation(s), <b>${observations.length}</b> informational observation(s), and <b>${coverage.filter((item) => item.attempted).length}</b> attempted coverage item(s).</p>`
+      : postureReview
       ? `<p>${escapeHtml(runStatusNote)} ${escapeHtml(requestDeliverySummary)} ${jobStatus === "complete" ? "This report records bounded HTTPS response observations for the exact pages in the saved target snapshot." : "Coverage and observations may be incomplete until the run completes."} No crawling, redirects, forms, authentication, or exploit payloads are used. This is not a vulnerability scan or an overall security verdict.</p><p><b>${observations.length}</b> informational observation(s), and <b>${coverage.filter((item) => item.attempted).length}</b> checks attempted.</p>`
       : publicReview
       ? `<p>${escapeHtml(runStatusNote)} ${escapeHtml(requestDeliverySummary)} ${jobStatus === "complete" ? "This report contains passive observations from the exact public HTTPS pages in this run's target snapshot." : "Coverage and observations may be incomplete until the run completes."} It does not contain vulnerability probes or prove a security issue.</p><p><b>${suspected.length}</b> suspected page-level observation(s), and <b>${coverage.filter((item) => item.attempted).length}</b> checks attempted.</p>`
@@ -656,24 +904,30 @@ function reportHtml(kind: string, data: NonNullable<ReturnType<typeof reportsFor
   const attestationWasRecorded = typeof attestation.attestedAt === "string" && attestation.attestedAt.length > 0;
   const attestationSummary = postureReview || publicReview
     ? `<section><h2>${publicReview ? "Public review confirmation" : "Operator attestation"}</h2><p>Recorded at ${escapeHtml(attestation.attestedAt || "unknown time")}.</p><p>Authorization attested: ${attestation.authorized === true ? "Yes" : "No"}. Safe GET attested: ${attestation.safeGet === true ? "Yes" : "No"}.</p><blockquote>${escapeHtml(attestation.statement || "No confirmation statement was saved.")}</blockquote><p>${attestationWasRecorded ? "Identity, ownership, and permission were not independently verified." : "No per-run confirmation was retained for this run."}</p></section>`
+    : webScan
+      ? `<section><h2>Per-run authorization</h2><p>Recorded at ${escapeHtml(attestation.attestedAt || "unknown time")} for ${escapeHtml(webScanOrigin)}.</p><p>Authorization attested: ${attestation.authorized === true ? "Yes" : "No"}. Safe unauthenticated GETs attested: ${attestation.safeGet === true ? "Yes" : "No"}.</p><blockquote>${escapeHtml(attestation.statement || "No confirmation statement was saved.")}</blockquote><p>Ownership and permission were not independently verified. Exact target paths and finding sample paths are omitted.</p></section>`
     : "";
   const logItems = logs.map((item) => `<li><time>${escapeHtml(item.created_at)}</time> · ${escapeHtml(item.level)} · ${escapeHtml(item.message)}</li>`).join("");
-  const empty = findings.length ? "" : postureReview
+  const empty = findings.length ? "" : webScan
+    ? "<p class=empty>No findings were raised by the checks that ran. Review coverage carefully; untested paths and behaviors were not evaluated, so an empty list does not establish that the target is secure.</p>"
+    : postureReview
     ? "<p class=empty>No posture observations were recorded. Incomplete coverage or no observations does not establish that the site is secure.</p>"
     : publicReview
     ? "<p class=empty>No page-level observations matched the listed checks. This is not a vulnerability scan or an overall security guarantee.</p>"
     : sourceReview
     ? "<p class=empty>No static patterns matched. This heuristic review is limited to the listed checks and is not proof that the source is secure.</p>"
     : "<p class=empty>No findings were stored for this run. Consult coverage to distinguish clean controls from checks that were not reproduced.</p>";
-  const scopeLabel = postureReview ? "HTTPS POSTURE OBSERVATIONS" : publicReview ? "PUBLIC PAGE REVIEW" : sourceReview ? "APPROVED LOCAL SOURCE" : "LOCAL SYNTHETIC TARGET";
-  const scopeNote = postureReview
+  const scopeLabel = webScan ? "WEB SECURITY SCAN" : postureReview ? "HTTPS POSTURE OBSERVATIONS" : publicReview ? "PUBLIC PAGE REVIEW" : sourceReview ? "APPROVED LOCAL SOURCE" : "LOCAL SYNTHETIC TARGET";
+  const scopeNote = webScan
+    ? `${runStatusNote} ${requestDeliverySummary} This is a safe baseline crawl, not a full dynamic application security test. It follows only same-origin HTTPS links without query strings, does not follow redirects, and skips action-like, token-shaped, ambiguous, and static-file paths. Requests include no authentication, cookies, referrer, or payloads; forms are inspected but never submitted. GET may still have side effects on an unknown route. DNS answers must be public and are pinned to the TLS-validated connection. Budgets cap pages, requests, depth, time, and in-memory response-body processing. Ownership is self-attested and not independently verified. Response bodies and cookie values are not retained. An absence of findings does not prove security.`
+    : postureReview
     ? `${runStatusNote} ${requestDeliverySummary} An HTTP response received by RevenueGuard confirms a response for that target; no response does not establish whether the GET was sent. GET can still cause side effects. No redirects, crawling, credentials, forms, payloads, or assets are used. The operator attestation is not independent proof of authorization. Results describe selected response facts at the time of this run, not site-wide security. Response bodies, cookie names, and cookie values are not retained.`
     : publicReview
     ? `${runStatusNote} ${requestDeliverySummary} An HTTP response received by RevenueGuard confirms a response for that target; no response does not establish whether the GET was sent. GET requests can still trigger side effects on some sites; only include pages known to be safe to request. No redirects, cookies, forms, assets, or page links are followed. The HTML body is parsed in memory and is not stored.`
     : sourceReview
     ? "This report contains read-only static pattern matches from the explicitly approved local source directories in scope.json. It does not execute source code or prove runtime exploitability."
     : "This report contains evidence from a local demo app with synthetic users, records, and files. It is not proof that another application is vulnerable or secure.";
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · RevenueGuard Lab</title><link rel="stylesheet" href="/report.css"><script src="/report.js" defer></script></head><body><main><header><div><p class="eyebrow">REVENUEGUARD LAB · ${scopeLabel}</p><h1>${escapeHtml(title)}</h1><p class="sub">Run ${escapeHtml(job.id)} · ${escapeHtml(job.profile)} · ${escapeHtml(job.status)}</p></div><button id="print">Print / Save as PDF</button></header><section class="notice"><b>Scope note:</b> ${escapeHtml(scopeNote)}</section>${summary}${publicScopeItems}${attestationSummary}<section><h2>Coverage</h2><ul>${coverageItems || "<li>No checks were recorded.</li>"}</ul></section><section><h2>${postureReview ? "Observations" : "Findings"}</h2>${empty}${details}</section><section><h2>Execution log</h2><ul>${logItems || "<li>No log entries.</li>"}</ul></section><footer>Generated locally · ${escapeHtml(now())}</footer></main></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · RevenueGuard</title><link rel="stylesheet" href="/report.css"><script src="/report.js" defer></script></head><body><main><header><div><p class="eyebrow">REVENUEGUARD · ${scopeLabel}</p><h1>${escapeHtml(title)}</h1><p class="sub">Run ${escapeHtml(job.id)} · ${escapeHtml(job.profile)} · ${escapeHtml(job.status)}</p></div><button id="print">Print / Save as PDF</button></header><section class="notice"><b>Scope note:</b> ${escapeHtml(scopeNote)}</section>${summary}${publicScopeItems}${attestationSummary}<section><h2>Coverage</h2><ul>${coverageItems || "<li>No checks were recorded.</li>"}</ul></section><section><h2>${postureReview ? "Observations" : "Findings"}</h2>${empty}${details}</section><section><h2>Execution log</h2><ul>${logItems || "<li>No log entries.</li>"}</ul></section><footer>Generated locally · ${escapeHtml(now())}</footer></main></body></html>`;
 }
 
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -729,11 +983,14 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
 
   if (url.pathname === "/api/health" && req.method === "GET") {
     const publicReviewEnabled = scope.approvedServices.includes("passive-public-review") && scope.publicReadOnlyPages.length > 0;
+    const webScanEnabled = scope.approvedServices.includes("web-scan");
     json(res, 200, {
       ok: true,
-      mode: "laboratory",
+      mode: "scanner",
       bind: HOST,
-      externalNetwork: publicReviewEnabled,
+      externalNetworkEnabled: webScanEnabled || publicReviewEnabled,
+      webScanEnabled,
+      webScanRequests: "same-origin unauthenticated HTTPS GET crawl with per-run authorization, hard request/time/byte/page budgets, no credentials, no form submits, and no exploit payloads",
       publicReviewEnabled,
       publicRequests: "one GET per exact approved HTTPS page, only after a local user confirms and starts a review",
       postureReviewAvailable: publicReviewEnabled,
@@ -757,10 +1014,13 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (url.pathname === "/api/jobs" && req.method === "POST") {
     const body = await readJson(req);
     const action = body.action;
-    if (action !== "audit" && action !== "retest" && action !== "source-review" && action !== "public-review" && action !== "posture-review") { json(res, 400, { error: "Action must be audit, retest, source-review, public-review, or posture-review" }); return; }
+    if (action !== "audit" && action !== "retest" && action !== "source-review" && action !== "public-review" && action !== "posture-review" && action !== "web-scan") { json(res, 400, { error: "Action must be audit, retest, source-review, public-review, posture-review, or web-scan" }); return; }
     try {
       json(res, 202, enqueueJob(action, body.confirmPublicGet === true, {
         pages: body.pages,
+        target: body.target,
+        maxPages: body.maxPages,
+        maxDepth: body.maxDepth,
         authorizationAttestation: body.authorizationAttestation,
       }));
     }
@@ -769,7 +1029,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
 
   if (url.pathname === "/api/lab/profile" && req.method === "POST") {
-    const active = db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE status IN ('queued', 'running')").get() as { count?: number };
+    const active = db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE status IN ('queued', 'running', 'cancelling')").get() as { count?: number };
     if (Number(active.count || 0) > 0) { json(res, 409, { error: "Wait for queued audits to finish before changing the demo profile." }); return; }
     const body = await readJson(req);
     if (body.profile !== "vulnerable" && body.profile !== "secure") { json(res, 400, { error: "Profile must be vulnerable or secure" }); return; }
@@ -787,6 +1047,13 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const findings = db.prepare("SELECT * FROM findings WHERE job_id = ? ORDER BY created_at DESC").all(jobMatch[1]) as Array<Record<string, unknown>>;
     const logs = logsFor(jobMatch[1]);
     json(res, 200, { job: rowToJob(job), findings: findings.map(rowToFinding), logs });
+    return;
+  }
+
+  const cancelMatch = /^\/api\/jobs\/([a-f0-9-]+)\/cancel$/.exec(url.pathname);
+  if (cancelMatch && req.method === "POST") {
+    try { json(res, 200, cancelJob(cancelMatch[1])); }
+    catch (error) { json(res, 409, { error: error instanceof Error ? error.message : "Could not cancel this run" }); }
     return;
   }
 
@@ -813,11 +1080,15 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`RevenueGuard Lab is available at ${ORIGIN}`);
-  console.log("Scope: active checks stay loopback-only; optional public review uses only exact HTTPS pages in scope.json; callbacks are disabled.");
+  console.log(`RevenueGuard is available at ${ORIGIN}`);
+  console.log("Local single-operator scanner. External requests are limited to an explicitly authorized HTTPS same-origin baseline scan or an enabled exact-page review.");
   void drainQueue();
 });
 
-server.on("close", () => db.close());
-process.on("SIGINT", () => server.close());
-process.on("SIGTERM", () => server.close());
+server.on("close", () => {
+  httpServerClosed = true;
+  beginShutdown();
+  closeDatabaseWhenIdle();
+});
+process.on("SIGINT", () => { beginShutdown(); server.close(); });
+process.on("SIGTERM", () => { beginShutdown(); server.close(); });

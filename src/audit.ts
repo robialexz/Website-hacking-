@@ -10,6 +10,7 @@ export interface AuditEvidence {
   response?: { status: number; contentType: string; body: string };
   source?: { path: string; line: number; excerpt: string; sha256: string };
   page?: { url: string; status: number; contentType: string; elapsedMs: number; bytes: number; headers: Record<string, string> };
+  webScan?: { pageCount: number; samplePaths: string[]; checks: Record<string, unknown> };
   note?: string;
 }
 
@@ -48,6 +49,7 @@ export interface CoverageItem {
 export interface AuditResult {
   findings: AuditFinding[];
   coverage: CoverageItem[];
+  cancelled?: boolean;
 }
 
 export type AuditTransport = (

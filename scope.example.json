@@ -1,5 +1,5 @@
 {
-  "mode": "laboratory",
+  "mode": "scanner",
   "approvedOrigins": [
     "http://127.0.0.1:8765"
   ],
@@ -7,7 +7,9 @@
     "/lab/"
   ],
   "approvedServices": [
-    "revenueguard-demo"
+    "revenueguard-demo",
+    "source-review",
+    "web-scan"
   ],
   "sourceDirectories": [
     "./src"
@@ -27,7 +29,15 @@
     "maxSourceBytes": 2000000,
     "maxPublicPages": 4,
     "maxPublicBytesPerPage": 1000000,
-    "maxResponseBytes": 2000000
+    "maxResponseBytes": 2000000,
+    "maxWebScanRequests": 250,
+    "maxWebScanPages": 100,
+    "maxWebScanDepth": 4,
+    "maxWebScanDurationMs": 180000,
+    "maxWebScanBytes": 50000000,
+    "maxWebScanResponseBytes": 2000000,
+    "webScanTimeoutMs": 10000,
+    "webScanDelayMs": 100
   },
   "resetProcedure": "POST /api/lab/profile with {\"profile\":\"vulnerable\"} or {\"profile\":\"secure\"} resets synthetic state. No real data is used."
 }

@@ -331,8 +331,8 @@ function makeFinding(rule: Rule, file: SourceFile, lineNumber: number, codeLine:
 /** Read only the explicitly approved project-relative source directories. No code is executed and no network request is made. */
 export async function executeSourceReview(options: SourceReviewOptions): Promise<AuditResult> {
   const { scope, projectRoot } = options;
-  if (scope.mode !== "laboratory" || !scope.approvedServices.includes("source-review")) {
-    throw new Error('Scope must approve the "source-review" service in laboratory mode');
+  if ((scope.mode !== "laboratory" && scope.mode !== "scanner") || !scope.approvedServices.includes("source-review")) {
+    throw new Error('Scope must approve the "source-review" service in scanner mode');
   }
 
   const collection = collectFiles(scope, projectRoot);

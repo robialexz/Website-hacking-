@@ -47,10 +47,10 @@ function withScopeFile(value: unknown, run: (path: string) => void): void {
   }
 }
 
-test("loads a strict laboratory scope and rejects public or malformed origins", () => {
+test("loads a strict scanner scope and rejects public or malformed origins", () => {
   withScopeFile(scope(), (path) => {
     const loaded = loadScopeConfig(path);
-    assert.equal(loaded.mode, "laboratory");
+    assert.equal(loaded.mode, "scanner");
     assert.deepEqual(loaded.approvedOrigins, ["http://127.0.0.1:8765"]);
     assert.deepEqual(loaded.approvedPathPrefixes, ["/lab/"]);
     assert.deepEqual(loaded.sourceDirectories, ["./src"]);
@@ -58,7 +58,7 @@ test("loads a strict laboratory scope and rejects public or malformed origins", 
     assert.equal(loaded.budgets.maxSourceFiles, 500);
   });
   withScopeFile(scope({ approvedServices: ["revenueguard-demo"] }), (path) => {
-    assert.deepEqual(loadScopeConfig(path).approvedServices, ["revenueguard-demo"]);
+    assert.deepEqual(loadScopeConfig(path).approvedServices, ["revenueguard-demo", "web-scan"]);
   });
   withScopeFile(scope({ approvedServices: ["revenueguard-demo", "unknown-review"] }), (path) => {
     assert.throws(() => loadScopeConfig(path), /approvedServices/i);
@@ -112,7 +112,7 @@ test("loads a strict laboratory scope and rejects public or malformed origins", 
   delete legacy.publicReadOnlyPages;
   withScopeFile(legacy, (path) => {
     const loaded = loadScopeConfig(path);
-    assert.deepEqual(loaded.approvedServices, ["revenueguard-demo"]);
+    assert.deepEqual(loaded.approvedServices, ["revenueguard-demo", "web-scan"]);
     assert.equal(loaded.budgets.maxSourceFiles, 500);
     assert.equal(loaded.budgets.maxSourceBytes, 2_000_000);
     assert.deepEqual(loaded.publicReadOnlyPages, []);
@@ -126,7 +126,7 @@ test("loads a strict laboratory scope and rejects public or malformed origins", 
   };
   delete legacyWithSource.publicReadOnlyPages;
   withScopeFile(legacyWithSource, (path) => {
-    assert.deepEqual(loadScopeConfig(path).approvedServices, ["revenueguard-demo", "source-review"]);
+    assert.deepEqual(loadScopeConfig(path).approvedServices, ["revenueguard-demo", "source-review", "web-scan"]);
   });
 });
 
@@ -179,7 +179,7 @@ test("scopedFetch counts failed and successful requests against one audit budget
 });
 
 test("scopedFetch applies the configured timeout", async (t) => {
-  mock.method(globalThis, "fetch", async (_url, init) => new Promise((_resolve, reject) => {
+  mock.method(globalThis, "fetch", async (_url: RequestInfo | URL, init?: RequestInit) => new Promise((_resolve, reject) => {
     init?.signal?.addEventListener("abort", () => reject(new Error("aborted by timeout")), { once: true });
   }));
   t.after(() => mock.restoreAll());

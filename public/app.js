@@ -1,5 +1,5 @@
 const POSTURE_PAGE_CAP = 4;
-const state = { csrf: "", findings: new Map(), publicPages: [], publicReviewEnabled: false, postureSelectedPages: new Set(), posturePageCap: POSTURE_PAGE_CAP, active: false, timer: null };
+const state = { csrf: "", findings: new Map(), publicPages: [], publicReviewEnabled: false, webScanEnabled: false, webScanBudgets: { maxPages: 100, maxDepth: 4, maxRequests: 250, maxDurationMs: 180000, maxBytes: 50000000 }, activeWebScanId: null, postureSelectedPages: new Set(), posturePageCap: POSTURE_PAGE_CAP, active: false, timer: null };
 const $ = (selector) => document.querySelector(selector);
 
 async function api(path, options = {}) {
@@ -115,11 +115,12 @@ function renderJobs(items) {
   }
   for (const job of items.slice(0, 6)) {
     const row = node("div", "job-row");
-    const jobIcon = { queued: "◷", running: "◌", failed: "!", complete: "✓" }[job.status] || "•";
+    const jobIcon = { queued: "◷", running: "◌", cancelling: "◌", cancelled: "×", failed: "!", complete: "✓" }[job.status] || "•";
     row.append(node("div", "job-icon " + job.status, jobIcon));
     const main = node("div", "job-main");
     main.append(node("b", "", job.label || "Local security audit"));
-    const profileLabel = job.action === "posture-review" ? "HTTPS posture observations"
+    const profileLabel = job.action === "web-scan" ? `web scan · ${job.targetOrigin || "target hidden"}`
+      : job.action === "posture-review" ? "HTTPS posture observations"
       : job.profile === "approved-source" ? "approved source"
       : job.profile === "approved-public" ? "approved public pages"
       : `${job.profile} profile`;
@@ -128,13 +129,20 @@ function renderJobs(items) {
     const statusLabel = job.action === "posture-review" && job.status === "complete" ? "finished" : job.status;
     const status = node("span", `job-status ${job.status}`, statusLabel);
     row.append(status);
-    if (job.status === "complete" || job.action === "posture-review") {
-      const details = node("button", "detail-link", job.action === "posture-review" ? "Details" : "Logs");
+    if (job.status === "complete" || job.status === "cancelled" || job.action === "posture-review" || job.action === "web-scan") {
+      const details = node("button", "detail-link", job.action === "posture-review" || job.action === "web-scan" ? "Details" : "Logs");
       details.type = "button";
       details.addEventListener("click", () => showJob(job.id));
       row.append(details);
     }
-    if (job.status === "complete") {
+    if (job.action === "web-scan" && ["queued", "running", "cancelling"].includes(job.status)) {
+      const cancel = node("button", "detail-link", job.status === "cancelling" ? "Stopping…" : "Stop");
+      cancel.type = "button";
+      cancel.disabled = job.status === "cancelling";
+      cancel.addEventListener("click", () => cancelWebScan(job.id));
+      row.append(cancel);
+    }
+    if (job.status === "complete" || job.status === "cancelled") {
       const link = node("a", "report-link", "Report");
       link.href = `/reports/${encodeURIComponent(job.id)}/technical`;
       link.target = "_blank";
@@ -167,6 +175,55 @@ function updatePostureControls() {
     : !authorization.checked ? "Confirm that you are authorized to request these exact URLs."
     : !safeGet.checked ? "Confirm that one unauthenticated GET per selected route is safe to request."
     : "Ready to queue one unauthenticated GET for each selected URL.";
+}
+
+function webScanTargetOrigin(value) {
+  try {
+    if (value.trim() !== value) return null;
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash) return null;
+    if (!host.includes(".") || host.endsWith(".") || host.includes(":")) return null;
+    if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(host) || /\.(?:localhost|local|internal|test|example|invalid|home\.arpa|lan)$/.test(host)) return null;
+    const path = decodeURIComponent(url.pathname);
+    if (path.includes("%") || /[\\\u0000-\u001f]/.test(path)) return null;
+    const stateful = /(?:^|[-_.])(?:logout|log-out|signout|sign-out|unsubscribe|delete|destroy|remove|deactivate|disable|confirm|confirmation|activate|reset|purchase|checkout|payment|transfer|withdraw|subscribe|verify|callback|accept-invite|revoke|cancel)(?:$|[-_.])/i;
+    const sensitive = /^(?:token|key|secret|code|invite|session|auth|reset|verify|confirmation|unsubscribe)$/i;
+    if (path.split("/").filter(Boolean).some((segment) => stateful.test(segment) || sensitive.test(segment))) return null;
+    return url.origin;
+  } catch { return null; }
+}
+
+function updateWebScanControls() {
+  const target = $("#webScanTarget");
+  const pages = $("#webScanMaxPages");
+  const depth = $("#webScanMaxDepth");
+  const authorized = $("#webScanAuthorized");
+  const safeGet = $("#webScanSafeGet");
+  const button = $("#webScanButton");
+  const cancel = $("#cancelScanButton");
+  const hint = $("#webScanRunHint");
+  if (!target || !pages || !depth || !authorized || !safeGet || !button || !cancel || !hint) return;
+  const origin = webScanTargetOrigin(target.value);
+  const pageLimit = Number(pages.value);
+  const depthLimit = Number(depth.value);
+  const validBudget = Number.isInteger(pageLimit) && pageLimit >= 1 && pageLimit <= state.webScanBudgets.maxPages &&
+    Number.isInteger(depthLimit) && depthLimit >= 0 && depthLimit <= state.webScanBudgets.maxDepth;
+  const ready = state.webScanEnabled && !state.active && Boolean(origin) && validBudget && authorized.checked && safeGet.checked;
+  button.disabled = !ready;
+  button.textContent = state.activeWebScanId ? "Web scan in progress" : "Start web scan";
+  cancel.hidden = !state.activeWebScanId;
+  cancel.disabled = !state.activeWebScanId || state.cancelling;
+  pages.max = String(state.webScanBudgets.maxPages);
+  depth.max = String(state.webScanBudgets.maxDepth);
+  hint.textContent = !state.webScanEnabled ? "Web scanning is not enabled in the current local scope."
+    : state.activeWebScanId ? "A same-origin scan is running. You can stop it at any time."
+    : state.active ? "Another run is active. Wait for it to finish before starting a web scan."
+    : !origin ? "Enter a public HTTPS hostname and safe starting path without credentials, query strings, fragments, or obvious action-like paths."
+    : !validBudget ? "Choose page and depth limits within the configured scanner budget."
+    : !authorized.checked ? "Confirm that you own this origin or have permission to test it."
+    : !safeGet.checked ? "Confirm that bounded unauthenticated GET requests are acceptable for this target."
+    : `Ready to scan ${origin} · up to ${pageLimit} pages · depth ${depthLimit}.`;
 }
 
 function renderPosturePages(pages) {
@@ -246,13 +303,23 @@ async function refresh() {
     $("#scopeAccounts").textContent = data.scope.testAccounts.map((account) => `${account.name} (${account.role})`).join(", ") || "None configured";
     $("#scopeServices").textContent = data.scope.services.join(", ");
     $("#scopeReset").textContent = data.scope.resetProcedure;
+    state.webScanEnabled = data.scope.webScanAvailable === true && data.scope.services.includes("web-scan");
+    state.webScanBudgets = data.scope.webScanBudgets || state.webScanBudgets;
+    $("#webScanBudgetSummary").textContent = state.webScanEnabled
+      ? `${state.webScanBudgets.maxPages} pages · ${state.webScanBudgets.maxDepth} depth · ${state.webScanBudgets.maxRequests} requests`
+      : "Disabled in local scope";
+    $("#webScanBudgetDetails").textContent = state.webScanEnabled
+      ? `${Math.round(state.webScanBudgets.maxDurationMs / 1000)} sec total · ${Math.round((data.scope.webScanResponseBytes || 0) / 1_000_000)} MB/page processed in memory · ${Math.round(state.webScanBudgets.maxBytes / 1_000_000)} MB total processed in memory · ${data.scope.webScanTimeoutMs / 1000} sec/request timeout · ${data.scope.webScanDelayMs} ms between pages.`
+      : "Enable web-scan in the local scope file and restart the app.";
     $("#profileSelect").value = data.profile;
     $("#appVersion").textContent = `v${data.version}`;
     renderFindings(data.findings, data.summary.totalFindings);
     renderJobs(data.jobs);
-    const active = data.jobs.some((job) => job.status === "queued" || job.status === "running");
-    const activeJob = data.jobs.find((job) => job.status === "queued" || job.status === "running");
+    const active = data.jobs.some((job) => ["queued", "running", "cancelling"].includes(job.status));
+    const activeJob = data.jobs.find((job) => ["queued", "running", "cancelling"].includes(job.status));
     state.active = active;
+    state.activeWebScanId = activeJob?.action === "web-scan" ? activeJob.id : null;
+    state.cancelling = activeJob?.status === "cancelling";
     renderPosturePages(state.publicPages);
     $("#runAuditButton").disabled = active;
     $("#retestButton").disabled = active || data.profile !== "secure" || data.summary.jobs === 0;
@@ -261,12 +328,13 @@ async function refresh() {
     $("#sourceReviewButton").disabled = active || !sourceReviewEnabled;
     $("#publicReviewButton").disabled = active || !publicReviewEnabled || data.scope.publicPages.length === 0;
     $("#profileSelect").disabled = active;
-    const activeLabel = activeJob?.action === "source-review" ? "Source review in progress"
+    const activeLabel = activeJob?.action === "web-scan" ? "Web scan in progress"
+      : activeJob?.action === "source-review" ? "Source review in progress"
       : activeJob?.action === "public-review" ? "Public review in progress"
       : activeJob?.action === "posture-review" ? "HTTPS posture observations in progress"
       : activeJob?.action === "retest" ? "Retest in progress"
       : "Audit in progress";
-    $("#runAuditButton").innerHTML = active ? `<span>◌</span> ${activeLabel}` : "<span>＋</span> Run local audit";
+    $("#runAuditButton").innerHTML = active ? `<span>◌</span> ${activeLabel}` : "<span>＋</span> Run local fixture checks";
     $("#sourceReviewButton").textContent = active ? activeLabel : sourceReviewEnabled ? "Review approved source" : "Enable source review";
     $("#publicReviewButton").textContent = active ? activeLabel : !publicReviewEnabled ? "Enable public review" : data.scope.publicPages.length ? "Review approved pages" : "Configure approved pages";
     $("#postureReviewButton").textContent = active ? activeLabel
@@ -277,6 +345,7 @@ async function refresh() {
     $("#publicReviewDescription").textContent = data.scope.publicPages.length
       ? "Configured page(s): " + data.scope.publicPages.join(", ") + ". One unauthenticated GET per page; no redirects, cookies, assets, or page links are followed. GET can trigger actions on some sites, so each run asks you to confirm these pages are safe to request."
       : "No public pages are configured. Add exact HTTPS page URLs to publicReadOnlyPages in local scope.json and add passive-public-review to approvedServices, then restart the app.";
+    updateWebScanControls();
     if (active && !state.timer) state.timer = setInterval(refresh, 1600);
     if (!active && state.timer) { clearInterval(state.timer); state.timer = null; }
   } catch (error) {
@@ -308,9 +377,20 @@ async function showJob(id) {
         ["Recorded operator attestation", attestationDetails],
       ];
     })() : [];
+    const webScanBlocks = data.job.action === "web-scan" ? (() => {
+      const attestation = data.job.authorizationAttestation && typeof data.job.authorizationAttestation === "object" && !Array.isArray(data.job.authorizationAttestation)
+        ? data.job.authorizationAttestation
+        : {};
+      return [
+        ["Target origin", data.job.targetOrigin || "Unavailable"],
+        ["Scan budget", `${attestation.maxPages || "?"} pages · depth ${attestation.maxDepth ?? "?"}`],
+        ["Per-run authorization", `Recorded at: ${attestation.attestedAt || "Not recorded"}\nAuthorized: ${attestation.authorized === true ? "Yes" : "No"}\nUnauthenticated GETs attested: ${attestation.safeGet === true ? "Yes" : "No"}\n${attestation.statement || "No attestation statement was saved."}`],
+      ];
+    })() : [];
     const blocks = [
       ["Run", `${data.job.id} · ${data.job.status} · ${data.job.profile} profile`],
       ...postureBlocks,
+      ...webScanBlocks,
       ["Coverage", JSON.stringify(data.job.coverage || [], null, 2)],
       ["Execution log", (data.logs || []).map((entry) => `${entry.created_at} · ${entry.level} · ${entry.message}`).join("\n") || "No execution log entries."],
     ];
@@ -335,6 +415,30 @@ async function createJob(action) {
       if (!confirmPublicGet) return;
     }
     let requestBody = { action, confirmPublicGet };
+    if (action === "web-scan") {
+      const target = $("#webScanTarget").value;
+      const maxPages = Number($("#webScanMaxPages").value);
+      const maxDepth = Number($("#webScanMaxDepth").value);
+      const authorized = $("#webScanAuthorized").checked;
+      const safeGet = $("#webScanSafeGet").checked;
+      const origin = webScanTargetOrigin(target);
+      if (!origin) throw new Error("Enter one public HTTPS URL without credentials, a query string, or a fragment.");
+      if (!authorized || !safeGet) throw new Error("Confirm both authorization and safe GET statements before starting.");
+      if (!Number.isInteger(maxPages) || maxPages < 1 || maxPages > state.webScanBudgets.maxPages ||
+          !Number.isInteger(maxDepth) || maxDepth < 0 || maxDepth > state.webScanBudgets.maxDepth) {
+        throw new Error("Choose page and depth values within the displayed scanner budget.");
+      }
+      requestBody = {
+        action: "web-scan",
+        target,
+        maxPages,
+        maxDepth,
+        authorizationAttestation: {
+          authorized: true, safeGet: true, version: 2,
+          target: new URL(target).href, origin, maxPages, maxDepth,
+        },
+      };
+    }
     if (action === "posture-review") {
       const pages = [...state.postureSelectedPages];
       const authorized = $("#postureAuthorizationAttestation").checked;
@@ -353,7 +457,13 @@ async function createJob(action) {
       $("#postureSafeGetAttestation").checked = false;
       updatePostureControls();
     }
-    showToast(action === "retest" ? "Retest queued against the selected secure profile"
+    if (action === "web-scan") {
+      $("#webScanAuthorized").checked = false;
+      $("#webScanSafeGet").checked = false;
+      updateWebScanControls();
+    }
+    showToast(action === "web-scan" ? "Web security scan queued"
+      : action === "retest" ? "Retest queued against the selected secure profile"
       : action === "source-review" ? "Source review queued"
       : action === "public-review" ? "Public page review queued"
       : action === "posture-review" ? "HTTPS posture observations queued"
@@ -364,6 +474,17 @@ async function createJob(action) {
   }
 }
 
+async function cancelWebScan(jobId = state.activeWebScanId) {
+  if (!jobId) return;
+  try {
+    await api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST", body: "{}" });
+    state.cancelling = true;
+    updateWebScanControls();
+    showToast("Cancellation requested; the active request is being stopped.");
+    await refresh();
+  } catch (error) { showToast(error.message || "Could not stop this scan"); }
+}
+
 $("#runAuditButton").addEventListener("click", () => createJob("audit"));
 $("#retestButton").addEventListener("click", () => createJob("retest"));
 $("#sourceReviewButton").addEventListener("click", () => createJob("source-review"));
@@ -371,13 +492,31 @@ $("#publicReviewButton").addEventListener("click", () => createJob("public-revie
 $("#postureReviewButton").addEventListener("click", () => createJob("posture-review"));
 $("#postureAuthorizationAttestation").addEventListener("change", updatePostureControls);
 $("#postureSafeGetAttestation").addEventListener("change", updatePostureControls);
+$("#webScanButton").addEventListener("click", () => createJob("web-scan"));
+$("#cancelScanButton").addEventListener("click", () => cancelWebScan());
+for (const selector of ["#webScanTarget", "#webScanMaxPages", "#webScanMaxDepth"]) {
+  $(selector).addEventListener("input", () => {
+    $("#webScanAuthorized").checked = false;
+    $("#webScanSafeGet").checked = false;
+    updateWebScanControls();
+  });
+  $(selector).addEventListener("change", () => {
+    $("#webScanAuthorized").checked = false;
+    $("#webScanSafeGet").checked = false;
+    updateWebScanControls();
+  });
+}
+for (const selector of ["#webScanAuthorized", "#webScanSafeGet"]) {
+  $(selector).addEventListener("input", updateWebScanControls);
+  $(selector).addEventListener("change", updateWebScanControls);
+}
 $("#refreshButton").addEventListener("click", refresh);
 $("#closeDialog").addEventListener("click", () => $("#detailDialog").close());
 $("#detailDialog").addEventListener("click", (event) => { if (event.target === $("#detailDialog")) $("#detailDialog").close(); });
 $("#profileSelect").addEventListener("change", async (event) => {
   try {
     await api("/api/lab/profile", { method: "POST", body: JSON.stringify({ profile: event.target.value }) });
-    showToast(`Demo switched to the ${event.target.value} profile. Synthetic state was reset.`);
+    showToast(`Training fixture switched to the ${event.target.value} profile. Synthetic state was reset.`);
     await refresh();
   } catch (error) { showToast(error.message); }
 });
@@ -387,6 +526,6 @@ async function start() {
     const session = await api("/api/session");
     state.csrf = session.csrfToken;
     await refresh();
-  } catch (error) { showToast(error.message || "RevenueGuard Lab is unavailable"); }
+  } catch (error) { showToast(error.message || "RevenueGuard is unavailable"); }
 }
 start();
