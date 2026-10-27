@@ -108,7 +108,8 @@ test("local API keeps web-scan paths out of saved history and rejects a slow job
 
     const databasePath = join(projectDir, "data", "revenueguard.sqlite");
     const db = new DatabaseSync(databasePath);
-    db.prepare("DELETE FROM settings WHERE key = 'web_scan_path_privacy_v1'").run();
+    db.prepare("DELETE FROM settings WHERE key = 'web_scan_path_privacy_v2'").run();
+    db.prepare("INSERT INTO settings(key, value) VALUES('web_scan_path_privacy_v1', '1') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
     db.prepare("INSERT INTO jobs(id, action, profile, status, created_at, finished_at, error, coverage_json, scope_json, target_pages_json, attestation_json) VALUES(?, 'web-scan', 'web-baseline', 'complete', ?, ?, ?, ?, ?, ?, ?)")
       .run(JOB_ID, new Date().toISOString(), new Date().toISOString(), `Old error ${TARGET}`,
         JSON.stringify([{ key: "web.fetch.page-1", label: `Fetch ${TARGET}`, attempted: true, status: "NOT TESTED", error: TARGET }]),
@@ -121,7 +122,7 @@ test("local API keeps web-scan paths out of saved history and rejects a slow job
     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", JOB_ID, "web.headers.csp", "Fixture finding", "Fixture", "Low", "SUSPECTED", "Medium",
         "https://scan.example.net", TARGET, "HTTP response", "Fixture", "Expected", `Observed on 1 page(s). Sample paths: ${TARGET}.`, JSON.stringify([TARGET]), "Fixture", "Fixture", "Fixture",
-        JSON.stringify({ webScan: { pageCount: 1, samplePaths: [TARGET], checks: {} }, note: TARGET }), "NOT RETESTED", new Date().toISOString());
+        JSON.stringify({ webScan: { pageCount: 1, samplePaths: [TARGET], checks: { cspPresent: false, directiveCount: 2, xContentTypeOptions: TOKEN } }, note: TARGET }), "NOT RETESTED", new Date().toISOString());
     db.prepare("INSERT INTO execution_logs(job_id, created_at, level, message) VALUES(?, ?, 'warning', ?)")
       .run(JOB_ID, new Date().toISOString(), `Old log ${TARGET}`);
     db.prepare("INSERT INTO jobs(id, action, profile, status, created_at, finished_at, coverage_json, scope_json, target_pages_json, attestation_json) VALUES(?, 'web-scan', 'web-baseline', 'complete', ?, ?, '[]', '{}', '[]', ?)")
@@ -224,13 +225,17 @@ test("local API keeps web-scan paths out of saved history and rejects a slow job
     const finding = verifyDb.prepare("SELECT endpoint, actual, evidence_json, reproduction_json FROM findings WHERE job_id = ?").get(JOB_ID) as Record<string, unknown>;
     const logs = verifyDb.prepare("SELECT message FROM execution_logs WHERE job_id = ?").all(JOB_ID);
     const jobCount = verifyDb.prepare("SELECT COUNT(*) AS count FROM jobs").get() as { count: number };
+    const privacyVersion = verifyDb.prepare("SELECT value FROM settings WHERE key = 'web_scan_path_privacy_v2'").get() as { value?: string };
     verifyDb.close();
-    const persisted = JSON.stringify({ job, targetOnlyJobRow, malformedJobRow, finding, logs, jobCount });
+    const persisted = JSON.stringify({ job, targetOnlyJobRow, malformedJobRow, finding, logs, jobCount, privacyVersion });
     assert.doesNotMatch(persisted, new RegExp(TOKEN));
     assert.equal(jobCount.count, 3, "shutdown must not acknowledge or insert a stranded queued run");
     assert.deepEqual(JSON.parse(String(job.target_pages_json)), ["https://scan.example.net"]);
     assert.deepEqual(JSON.parse(String(targetOnlyJobRow.target_pages_json)), ["https://scan.example.net"]);
     assert.deepEqual(JSON.parse(String(malformedJobRow.target_pages_json)), []);
+    assert.equal(privacyVersion.value, "2");
+    const migratedEvidence = JSON.parse(String(finding.evidence_json)) as { webScan: { checks: Record<string, unknown> } };
+    assert.deepEqual(migratedEvidence.webScan.checks, { cspPresent: false, directiveCount: 2, xContentTypeOptions: "invalid" });
   } finally {
     if (child) await stopServer(child).catch(() => child?.kill("SIGKILL"));
     await rm(projectDir, { recursive: true, force: true });

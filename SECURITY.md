@@ -14,7 +14,7 @@ RevenueGuard is a local, single-operator website security baseline scanner. It i
 
 ## Data handling
 
-Run history is stored locally in `data/revenueguard.sqlite`. It includes the starting URL with its path, timestamps, coverage, findings, and execution logs. Response bodies, cookie names, and cookie values are not retained. Job APIs and reports show the origin and redacted sample paths. There is no automatic retention period or per-run deletion screen; stop the app and remove the SQLite file to clear history. Remove configured page URLs separately from local `scope.json`.
+Run history is stored locally in `data/revenueguard.sqlite`. For `web-scan` jobs, the exact starting path is held in process memory only while the run is queued or active. SQLite stores the origin, aggregate page counts, and normalized check facts; findings and reports omit route paths. Web-scan response bodies and cookie names or values are not retained, and response-header values are reduced to a small set of safe labels before storage. Startup migrates paths saved by earlier web-scan builds. The migration updates active records but cannot erase prior backups or guarantee forensic removal from SQLite journal or free-page copies. Other exact-page workflows may save configured URL paths in job or scope snapshots, and local source reviews may retain file names and evidence needed for their reports. There is no automatic retention period or per-run deletion screen; stop the app and remove the SQLite file to clear active history. Remove configured page URLs separately from local `scope.json`.
 
 ## Report a vulnerability
 

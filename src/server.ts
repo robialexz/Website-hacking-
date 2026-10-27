@@ -15,6 +15,7 @@ import { executeSourceReview } from "./source-review.ts";
 import { executePublicReview } from "./public-review.ts";
 import { executePostureReview, POSTURE_REVIEW_MAX_PAGES } from "./posture-review.ts";
 import { executeWebScan, parseWebScanTarget, scannerBudgetSummary } from "./web-scan.ts";
+import { sanitizeWebScanChecks, sanitizeWebScanFinding } from "./web-scan-privacy.ts";
 
 const HOST = "127.0.0.1";
 const PORT = process.env.REVENUEGUARD_PORT === undefined ? 8765 : Number(process.env.REVENUEGUARD_PORT);
@@ -108,8 +109,8 @@ if (!jobColumns.some((column) => column.name === "attestation_json")) {
 }
 
 // Remove full target paths written by older web-scan builds from local history.
-const privacyMigration = db.prepare("SELECT value FROM settings WHERE key = 'web_scan_path_privacy_v1'").get() as { value?: string } | undefined;
-if (privacyMigration?.value !== "1") {
+const privacyMigration = db.prepare("SELECT value FROM settings WHERE key = 'web_scan_path_privacy_v2'").get() as { value?: string } | undefined;
+if (privacyMigration?.value !== "2") {
 const historicalWebScanJobs = db.prepare("SELECT id, target_pages_json, attestation_json, scope_json FROM jobs WHERE action = 'web-scan'").all() as Array<Record<string, unknown>>;
 for (const row of historicalWebScanJobs) {
   const rawTargets = safeJson(String(row.target_pages_json ?? "[]"), []);
@@ -144,11 +145,18 @@ for (const row of historicalWebScanJobs) {
       JSON.stringify([{ key: "web.history.sanitized", label: "Legacy scan coverage", attempted: false, status: "NOT TESTED", details: "Per-route coverage from a previous build was removed while sanitizing saved paths." }]), String(row.id));
   db.prepare("UPDATE execution_logs SET message = ? WHERE job_id = ?")
     .run("Legacy web-scan log details were removed while sanitizing saved paths.", String(row.id));
-  const findings = db.prepare("SELECT id, actual FROM findings WHERE job_id = ?").all(String(row.id)) as Array<Record<string, unknown>>;
+  const findings = db.prepare("SELECT id, actual, evidence_json FROM findings WHERE job_id = ?").all(String(row.id)) as Array<Record<string, unknown>>;
   for (const finding of findings) {
     const observedCount = /Observed on (\d+) page\(s\)\./.exec(String(finding.actual ?? ""))?.[1] || "1";
+    const savedEvidence = safeJson(String(finding.evidence_json ?? "{}"), {});
+    const savedWebScan = savedEvidence && typeof savedEvidence === "object" && !Array.isArray(savedEvidence)
+      ? (savedEvidence as Record<string, unknown>).webScan
+      : undefined;
+    const savedChecks = savedWebScan && typeof savedWebScan === "object" && !Array.isArray(savedWebScan)
+      ? (savedWebScan as Record<string, unknown>).checks
+      : undefined;
     const evidence = {
-      webScan: { pageCount: Number(observedCount), samplePaths: [], checks: {} },
+      webScan: { pageCount: Number(observedCount), samplePaths: [], checks: sanitizeWebScanChecks(savedChecks) },
       note: "Aggregate observations only; web-scan paths were omitted from local history.",
     };
     const reproduction = [
@@ -159,7 +167,7 @@ for (const row of historicalWebScanJobs) {
       .run(origin || "unknown target", origin || "unknown target", `Observed on ${observedCount} page(s). Sample paths omitted for privacy.`, JSON.stringify(evidence), JSON.stringify(reproduction), String(finding.id));
   }
 }
-db.prepare("INSERT INTO settings(key, value) VALUES('web_scan_path_privacy_v1', '1') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
+db.prepare("INSERT INTO settings(key, value) VALUES('web_scan_path_privacy_v2', '2') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run();
 }
 
 const savedProfile = db.prepare("SELECT value FROM settings WHERE key = 'lab_profile'").get() as { value?: string } | undefined;
@@ -425,9 +433,12 @@ function storeResult(jobId: string, action: string, profile: LabProfile, result:
     const state = finding.status === "CONFIRMED" ? "Still reproduces" : "Still present as suspected";
     return { ...finding, retestStatus: `${state} against secure demo profile in run ${jobId}` };
   });
+  const findingsForStorage = action === "web-scan"
+    ? retestFindings.map(sanitizeWebScanFinding)
+    : retestFindings;
   db.exec("BEGIN IMMEDIATE;");
   try {
-    for (const finding of retestFindings) storeFinding(jobId, finding);
+    for (const finding of findingsForStorage) storeFinding(jobId, finding);
 
     if (action === "retest" && profile === "secure" && verifiedStatuses.size > 0) {
       for (const [key, status] of verifiedStatuses) {
