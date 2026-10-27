@@ -4,46 +4,62 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>RevenueGuard Lab</title>
+  <title>RevenueGuard Web Security Scanner</title>
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" type="module"></script>
 </head>
 <body>
   <div class="shell">
     <aside class="sidebar" aria-label="Main navigation">
-      <a class="brand" href="/" aria-label="RevenueGuard Lab home">
+      <a class="brand" href="/" aria-label="RevenueGuard web scanner home">
         <span class="brand-mark">R</span>
-        <span><strong>RevenueGuard</strong><small>LAB ENVIRONMENT</small></span>
+        <span><strong>RevenueGuard</strong><small>LOCAL WEB SCANNER</small></span>
       </a>
       <div class="side-label">WORKSPACE</div>
       <nav>
-        <a class="nav-item active" href="#overview"><span class="nav-icon">▦</span> Overview</a>
+        <a class="nav-item active" href="#web-scan"><span class="nav-icon">⌕</span> Web scan</a>
         <a class="nav-item" href="#findings"><span class="nav-icon">⌕</span> Findings <span class="nav-count" id="sideFindingCount">0</span></a>
         <a class="nav-item" href="#jobs"><span class="nav-icon">◷</span> Audit runs</a>
-        <a class="nav-item" href="#source-review"><span class="nav-icon">⌘</span> Source review</a>
-        <a class="nav-item" href="#passive-review"><span class="nav-icon">↗</span> Public review</a>
-        <a class="nav-item" href="#posture-review"><span class="nav-icon">↗</span> HTTPS posture</a>
+        <a class="nav-item" href="#source-review"><span class="nav-icon">⌘</span> Local code review</a>
         <a class="nav-item" href="#scope"><span class="nav-icon">◎</span> Scope & safety</a>
       </nav>
       <div class="sidebar-bottom">
-        <div class="lab-status"><span class="status-dot"></span><div><b>Loopback lab</b><small>Public review is opt-in</small></div></div>
-        <p>RevenueGuard Lab<br>Local security validation</p>
+        <div class="lab-status"><span class="status-dot"></span><div><b>Local scanner</b><small>Single operator · loopback only</small></div></div>
+        <p>RevenueGuard<br>Authorized website baseline scans</p>
       </div>
     </aside>
 
     <main class="main">
       <header class="topbar">
         <div class="crumb"><span>Workspace</span><span class="crumb-sep">/</span><b>Overview</b></div>
-        <div class="top-actions"><span class="environment-pill"><span></span> LOOPBACK LAB</span><button class="icon-button" id="refreshButton" aria-label="Refresh dashboard" title="Refresh">↻</button></div>
+        <div class="top-actions"><span class="environment-pill"><span></span> LOCAL SCANNER</span><button class="icon-button" id="refreshButton" aria-label="Refresh dashboard" title="Refresh">↻</button></div>
       </header>
 
       <section class="page" id="overview">
         <div class="page-heading">
-          <div><p class="eyebrow">SECURITY VALIDATION</p><h1>Lab overview</h1><p class="subheading">Run dynamic checks on the synthetic app, review approved local source, or request one bounded GET to each explicitly listed public page. A GET may trigger site actions, so the app asks you to confirm each run.</p></div>
-          <div class="heading-actions"><label class="profile-control">Demo profile <select id="profileSelect"><option value="vulnerable">Vulnerable examples</option><option value="secure">Secure controls</option></select></label><button class="button button-secondary" id="retestButton" disabled>Retest findings</button><button class="button button-primary" id="runAuditButton"><span>＋</span> Run local audit</button></div>
+          <div><p class="eyebrow">AUTHORIZED WEB SECURITY</p><h1>Web security scanner</h1><p class="subheading">Crawl and review a website you own or have permission to test. The scanner uses bounded, unauthenticated same-origin HTTPS requests and reports exactly what it checked.</p></div>
+          <div class="heading-actions"><label class="profile-control">Training fixture <select id="profileSelect"><option value="vulnerable">Vulnerable examples</option><option value="secure">Secure controls</option></select></label><button class="button button-secondary" id="retestButton" disabled>Retest fixture</button><button class="button button-secondary" id="runAuditButton"><span>＋</span> Run local fixture checks</button></div>
         </div>
 
-        <div class="notice" role="note"><span class="notice-icon">i</span><span><b>Separate scopes.</b> Active checks stay on the synthetic loopback app. Source review reads only approved local code. Public review makes one unauthenticated GET per exact HTTPS page and does not follow redirects, forms, assets, or links. Some sites attach actions to GET routes, so confirm that each listed page is safe to request.</span><a href="#scope">Review scope</a></div>
+        <div class="notice" role="note"><span class="notice-icon">i</span><span><b>Safe baseline profile.</b> It follows same-origin HTTPS links without query strings, skips action-like and token-shaped routes, sends no credentials or payloads, and never submits forms. Any GET can still trigger site behavior; confirm the target and use only systems you are authorized to test.</span><a href="#scope">Review scope</a></div>
+
+        <section class="panel web-scan-panel" id="web-scan" aria-labelledby="webScanTitle">
+          <div class="web-scan-heading"><div><p class="eyebrow">START A REAL WEBSITE SCAN</p><h2 id="webScanTitle">Target and scan budget</h2><p>One HTTPS origin per run. Routes that contain query strings are skipped; redirects, static files, and obvious state-changing paths are not followed.</p></div><span class="scope-badge"><span class="status-dot"></span> SAME-ORIGIN</span></div>
+          <label class="scan-target-label" for="webScanTarget">Starting HTTPS URL</label>
+          <input id="webScanTarget" class="scan-target-input" type="url" inputmode="url" autocomplete="url" placeholder="https://&lt;your-domain&gt;/" maxlength="2048" spellcheck="false" aria-describedby="webScanTargetHelp">
+          <p id="webScanTargetHelp" class="field-help">Replace the placeholder with a public HTTPS domain you own or are authorized to test. The placeholder itself is not a valid target.</p>
+          <div class="scan-budget-controls">
+            <label>Maximum pages <input id="webScanMaxPages" type="number" min="1" max="100" value="100"></label>
+            <label>Link depth <input id="webScanMaxDepth" type="number" min="0" max="4" value="4"></label>
+          </div>
+          <fieldset class="scan-attestations">
+            <legend>Required for this run</legend>
+            <label><input type="checkbox" id="webScanAuthorized"> I own this website or have permission to test this exact HTTPS origin.</label>
+            <label><input type="checkbox" id="webScanSafeGet"> I accept unauthenticated GET requests to same-origin pages and understand a GET route may still cause an action.</label>
+          </fieldset>
+          <div class="web-scan-actions"><button class="button button-primary" id="webScanButton" disabled>Start web scan</button><button class="button button-secondary" id="cancelScanButton" hidden>Stop scan</button><p id="webScanRunHint" role="status" aria-live="polite">Enter an HTTPS URL and confirm both statements to start.</p></div>
+          <p class="web-scan-limit-note">No login session, cookies, form submits, exploit payloads, or cross-origin requests. Each run is capped by the page, depth, request, in-memory response-body processing, duration, per-request timeout, and delay budgets shown under Scope &amp; safety. Bodies are discarded after parsing; one received network chunk may exceed the remaining in-memory allowance. Web-scan routes are omitted from saved history and reports; token-shaped or action-like paths are skipped. Ownership is self-attested and is not independently verified.</p>
+        </section>
 
         <section class="panel source-review-panel" id="source-review">
           <div><p class="eyebrow">READ-ONLY CODE CHECKS</p><h2>Review approved source</h2><p>Inspect the local folders in scope.json for a small set of risky code patterns. Results are leads for manual validation, not proof of exploitability.</p></div>
@@ -97,20 +113,21 @@
         </div>
 
         <section class="panel scope-panel" id="scope">
-          <div class="panel-heading"><div><p class="eyebrow">GUARDRAILS</p><h2>Active laboratory scope</h2></div><span class="scope-badge"><span class="status-dot"></span> ENFORCED</span></div>
+          <div class="panel-heading"><div><p class="eyebrow">SCAN CONFIGURATION</p><h2>Active scanner scope</h2></div><span class="scope-badge"><span class="status-dot"></span> ENFORCED</span></div>
           <div class="scope-grid">
-            <div><small>APPROVED ORIGIN</small><b id="scopeOrigin">Loading…</b><p>Requests are limited to the local demo service.</p></div>
-            <div><small>APPROVED PATHS</small><b id="scopePaths">Loading…</b><p>Only the registered fixture API is tested.</p></div>
+            <div><small>LOCAL FIXTURE ORIGIN</small><b id="scopeOrigin">Loading…</b><p>Only the training fixture uses this loopback scope.</p></div>
+            <div><small>LOCAL FIXTURE PATHS</small><b id="scopePaths">Loading…</b><p>External scans get a separate per-run HTTPS origin scope.</p></div>
             <div><small>APPROVED SOURCE</small><b id="scopeSources">Loading…</b><p id="scopeSourceBudget">Read-only file inspection; symlinks and generated folders are skipped.</p></div>
             <div><small>PUBLIC PAGES</small><b id="scopePublicPages">Loading…</b><p id="scopePublicBudget">One GET per listed page; no crawling, credentials, redirects, or form submits.</p></div>
-            <div><small>REQUEST BUDGET</small><b id="scopeBudget">Loading…</b><p>One audit at a time, with a fixed timeout.</p></div>
+            <div><small>LOCAL FIXTURE REQUEST BUDGET</small><b id="scopeBudget">Loading…</b><p>External web scans have separate larger caps below.</p></div>
+            <div><small>WEB SCAN BUDGETS</small><b id="webScanBudgetSummary">Loading…</b><p id="webScanBudgetDetails">Same-origin GETs only; request, time, and response bytes are capped.</p></div>
             <div><small>TEST ACCOUNTS</small><b id="scopeAccounts">Loading…</b><p>Synthetic identities only.</p></div>
             <div><small>APPROVED SERVICES</small><b id="scopeServices">Loading…</b><p>No callback integrations are enabled.</p></div>
-            <div><small>RESET PROCEDURE</small><b id="scopeReset">Loading…</b><p>Applies to the disposable synthetic demo state.</p></div>
+            <div><small>RESET PROCEDURE</small><b id="scopeReset">Loading…</b><p>Applies only to the disposable local training fixture.</p></div>
           </div>
         </section>
 
-        <footer class="footer"><span>RevenueGuard Lab <span id="appVersion"></span></span><span>Local-only app · no cloud processing · optional public reviews contact only selected sites · no crawling or target discovery</span></footer>
+        <footer class="footer"><span>RevenueGuard <span id="appVersion"></span></span><span>Local-only, single operator · no cloud processing · authorized same-origin HTTPS baseline scans · no authentication or exploit payloads</span></footer>
       </section>
     </main>
   </div>

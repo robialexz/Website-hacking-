@@ -77,13 +77,13 @@ test("secure controls remove confirmed findings while retaining an honest synthe
   assert.equal(isCompleteRetest(result), true);
 });
 
-test("failed requests are recorded as not reproduced rather than fabricated findings", async () => {
+test("failed requests are recorded as untested rather than clean or fabricated findings", async () => {
   const transport = async (): Promise<ScopedFetchResponse> => {
     throw new Error("synthetic timeout");
   };
   const result = await executeAudit({ scope, transport });
   assert.equal(result.findings.length, 0);
-  assert(result.coverage.every((item) => item.status === "NOT REPRODUCED"));
+  assert(result.coverage.every((item) => item.status === "NOT TESTED"));
   assert(result.coverage.every((item) => item.error === "synthetic timeout"));
   assert.equal(isCompleteRetest(result), false);
 });

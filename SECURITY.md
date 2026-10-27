@@ -1,20 +1,21 @@
 # Security policy
 
-## Safe use
+RevenueGuard is a local, single-operator website security baseline scanner. It is not a hosted multi-user service. The dashboard listens only on `127.0.0.1:8765`; do not expose it to a network.
 
-RevenueGuard Lab is a local-only learning application. Its vulnerable routes under `/lab/` are a synthetic fixture; those results do not describe any other system. A separate optional HTTPS posture workflow makes bounded observations of exact HTTPS pages listed in local `scope.json`.
+## Web scan boundaries
 
-Use HTTPS posture observations only for exact pages that you own or are explicitly authorized to review, and only when a single unauthenticated GET to each page is safe. Before a run, the operator must attest to that authorization and safety. The attestation is not verification or proof of authorization. GET requests can still trigger side effects, so exclude state-changing, tokenized, confirmation, unsubscribe, and similar URLs.
+- A run uses one public DNS origin, HTTPS port 443, and unauthenticated GET requests.
+- The scanner rejects IP literal targets and private/reserved DNS answers, pins the checked address, validates TLS, and does not follow redirects.
+- The crawler stays on the starting origin and enforces page, depth, request, duration, per-request timeout, response-body retention, and pacing limits.
+- It skips query-string links, static files, obvious action-like paths, and ambiguous encoded paths. These filters are heuristic and cannot prove a GET route has no side effect.
+- The scanner does not send cookies, credentials, payloads, or form submissions and does not execute JavaScript.
+- The operator's per-run authorization and safe-GET confirmations are self-attestations, not independent proof of ownership or permission.
+- Findings are limited passive observations. No finding does not establish that a site is secure.
 
-The posture workflow is limited to one unauthenticated GET per exact scoped page. It does not crawl, follow links or redirects, use authentication, submit forms, or send payload probes. It is not an active vulnerability scan and does not establish that a site is secure. Do not change the loopback binding, fixed synthetic audit origin, or scope guard to enable active tests against public systems.
+## Data handling
 
-The app is intended for one local operator. It has no production multi-user accounts or tenant isolation; do not expose it to a network or present it as a hosted production scanning service.
+Run history is stored locally in `data/revenueguard.sqlite`. It includes the starting URL with its path, timestamps, coverage, findings, and execution logs. Response bodies, cookie names, and cookie values are not retained. Job APIs and reports show the origin and redacted sample paths. There is no automatic retention period or per-run deletion screen; stop the app and remove the SQLite file to clear history. Remove configured page URLs separately from local `scope.json`.
 
-The synthetic demo uses fake users and records, in-memory files, fixed input canaries, and a fictional dependency marker. It makes no external callbacks and performs no real purchases or file reads. The passive SEO/accessibility review is separate from both the synthetic demo and the HTTPS posture workflow.
+## Report a vulnerability
 
-## Reporting a defect in this project
-
-If you find a security defect in RevenueGuard Lab itself, use GitHub's **Report a vulnerability** option if private vulnerability reporting is enabled for the repository. Otherwise, contact the repository owner through their GitHub profile before sharing exploit details publicly.
-
-Please include the affected version or commit, the local steps to reproduce the issue, and the impact. Do not include credentials, real customer information, or details about an unrelated third-party target.
-
+If you find a security defect in RevenueGuard itself, use GitHub's **Report a vulnerability** option if private vulnerability reporting is enabled for the repository. Otherwise, contact the repository owner through their GitHub profile before sharing exploit details publicly.

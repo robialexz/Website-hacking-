@@ -4,6 +4,7 @@ import { isIP } from "node:net";
 import { performance } from "node:perf_hooks";
 
 import type { AuditEvidence, AuditFinding, AuditResult, CoverageItem, Severity } from "./audit.ts";
+import { decodeHtmlEntities, tokenizeHtml } from "./html-tokenizer.ts";
 import { assertPublicPageInScope } from "./scope.ts";
 import type { ScopeConfig } from "./scope.ts";
 
@@ -27,10 +28,10 @@ export interface PublicPageResponse {
   };
 }
 
-export type PublicPageTransport = (url: URL, scope: ScopeConfig) => Promise<PublicPageResponse>;
+export type PublicPageTransport = (url: URL, scope: ScopeConfig, signal?: AbortSignal) => Promise<PublicPageResponse>;
 
 interface PassivePublicGetDependencies {
-  resolveAddress: typeof resolvePinnedPublicAddress;
+  resolveAddresses: (hostname: string) => Promise<Array<{ address: string; family: number }>>;
   makeRequest: typeof httpsRequest;
 }
 
@@ -47,6 +48,10 @@ const SAFE_RESPONSE_HEADERS = [
   "x-content-type-options",
   "referrer-policy",
   "permissions-policy",
+  "access-control-allow-origin",
+  "access-control-allow-credentials",
+  "server",
+  "x-powered-by",
 ] as const;
 
 const REQUIRED_SECURITY_HEADERS = [
@@ -96,23 +101,28 @@ export function isPublicAddress(address: string): boolean {
   return true;
 }
 
-function timeoutPromise<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+function timeoutPromise<T>(promise: Promise<T>, timeoutMs: number, message: string, signal?: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    const finish = (error?: unknown, value?: T): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (error !== undefined) reject(error);
+      else resolve(value as T);
+    };
+    const timer = setTimeout(() => finish(new Error(message)), timeoutMs);
+    const onAbort = (): void => finish(new Error("Public page request cancelled."));
+    if (signal?.aborted) { onAbort(); return; }
+    signal?.addEventListener("abort", onAbort, { once: true });
     promise.then(
-      (value) => { clearTimeout(timer); resolve(value); },
-      (error) => { clearTimeout(timer); reject(error); },
+      (value) => finish(undefined, value),
+      (error) => finish(error),
     );
   });
 }
 
-async function resolvePinnedPublicAddress(hostname: string, timeoutMs: number): Promise<{ address: string; family: number }> {
+async function resolvePublicAddresses(hostname: string): Promise<Array<{ address: string; family: number }>> {
   if (isIP(hostname) !== 0) throw new Error("Public review requires a DNS hostname, not an IP address.");
-  const records = await timeoutPromise(dnsLookup(hostname, { all: true, verbatim: true }), timeoutMs, "DNS resolution timed out.");
-  if (!records.length || records.some((record) => !isPublicAddress(record.address))) {
-    throw new Error("DNS returned a non-public or reserved address; no request was sent.");
-  }
-  return records[0];
+  return dnsLookup(hostname, { all: true, verbatim: true });
 }
 
 function safeHeadersFromResponse(headers: Record<string, string | string[] | undefined>): Headers {
@@ -158,7 +168,8 @@ function isHtml(headers: Headers): boolean {
 export async function passivePublicGet(
   value: string | URL,
   scope: ScopeConfig,
-  dependencies: PassivePublicGetDependencies = { resolveAddress: resolvePinnedPublicAddress, makeRequest: httpsRequest },
+  dependencies: PassivePublicGetDependencies = { resolveAddresses: resolvePublicAddresses, makeRequest: httpsRequest },
+  signal?: AbortSignal,
 ): Promise<PublicPageResponse> {
   const url = assertPublicPageInScope(value, scope);
   if (!scope.approvedServices.includes("passive-public-review")) {
@@ -166,11 +177,19 @@ export async function passivePublicGet(
   }
   const startedAt = performance.now();
   const timeoutMs = scope.budgets.timeoutMs;
-  const address = await dependencies.resolveAddress(url.hostname, timeoutMs);
+  if (signal?.aborted) throw new Error("Public page request cancelled.");
+  const addresses = await timeoutPromise(dependencies.resolveAddresses(url.hostname), timeoutMs, "DNS resolution timed out.", signal);
+  if (signal?.aborted) throw new Error("Public page request cancelled.");
   const elapsedMs = performance.now() - startedAt;
+  if (!addresses.length || addresses.some((address) => {
+    const addressFamily = typeof address.address === "string" ? isIP(address.address) : 0;
+    return (address.family !== 4 && address.family !== 6) || addressFamily !== address.family || !isPublicAddress(address.address);
+  })) throw new Error("DNS returned a non-public or invalid address; no request was sent.");
+  const address = addresses[0];
   const addressFamily = typeof address?.address === "string" ? isIP(address.address) : 0;
   if (
     elapsedMs >= timeoutMs ||
+    !address ||
     (address.family !== 4 && address.family !== 6) ||
     addressFamily !== address.family ||
     !isPublicAddress(address.address)
@@ -216,7 +235,7 @@ export async function passivePublicGet(
       headers: {
         accept: "text/html,application/xhtml+xml",
         "accept-encoding": "identity",
-        "user-agent": "RevenueGuardLab/0.2 public-page-review",
+        "user-agent": "RevenueGuard/0.4 authorized-https-review",
       },
       rejectUnauthorized: true,
     }, (response) => {
@@ -256,14 +275,16 @@ export async function passivePublicGet(
 
       response.on("data", (chunk: Buffer | string) => {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        bodyBytes += buffer.byteLength;
-        if (bodyBytes > maxBytes) {
-          response.destroy();
-          request.destroy(new Error("Public page exceeded the configured response byte limit."));
-          finish(undefined, responseWithoutBody(bodyBytes));
-          return;
+        const remainingBytes = Math.max(0, maxBytes - bodyBytes);
+        const retained = buffer.subarray(0, remainingBytes);
+        if (retained.byteLength > 0) {
+          chunks.push(retained);
+          bodyBytes += retained.byteLength;
         }
-        chunks.push(buffer);
+        if (retained.byteLength < buffer.byteLength) {
+          response.destroy();
+          finish(undefined, responseWithoutBody(bodyBytes));
+        }
       });
       response.on("end", () => {
         finish(undefined, {
@@ -282,6 +303,12 @@ export async function passivePublicGet(
 
     totalTimer = setTimeout(() => request.destroy(new Error("Public page request timed out.")), remainingMs);
     request.setTimeout(remainingMs, () => request.destroy(new Error("Public page request timed out.")));
+    if (signal) {
+      const abortRequest = (): void => { request.destroy(new Error("Public page request cancelled.")); };
+      signal.addEventListener("abort", abortRequest, { once: true });
+      request.on("close", () => signal.removeEventListener("abort", abortRequest));
+      if (signal.aborted) abortRequest();
+    }
     request.on("error", (error) => {
       if (statusOnlyResponse) finish(undefined, statusOnlyResponse(bodyBytes));
       else finish(error instanceof Error ? error : new Error("Public page request failed."));
@@ -290,41 +317,39 @@ export async function passivePublicGet(
   });
 }
 
-function decodeHtmlText(value: string): string {
-  const decodeCodePoint = (code: number): string => Number.isInteger(code) && code >= 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff)
-    ? String.fromCodePoint(code)
-    : "\uFFFD";
-  return value.replace(/<[^>]*>/g, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">").replace(/&quot;/gi, "\"").replace(/&#39;|&apos;/gi, "'")
-    .replace(/&#(\d+);/g, (_match, code: string) => decodeCodePoint(Number(code)))
-    .replace(/&#x([\da-f]+);/gi, (_match, code: string) => decodeCodePoint(Number.parseInt(code, 16)))
-    .replace(/\s+/g, " ").trim();
-}
-
-function attribute(tag: string, name: string): string | undefined {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = new RegExp(`\\b${escaped}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i").exec(tag);
-  return match?.[1] ?? match?.[2] ?? match?.[3];
-}
-
 function pageMetadata(html: string): { titleLength: number; hasTitle: boolean; descriptionLength: number; hasDescription: boolean; h1Count: number } {
-  const titleMatch = /<title\b[^>]*>([\s\S]*?)<\/title\s*>/i.exec(html);
-  const title = titleMatch ? decodeHtmlText(titleMatch[1]) : "";
-  const metaTags = html.match(/<meta\b[^>]*>/gi) || [];
-  const descriptionTag = metaTags.find((tag) => attribute(tag, "name")?.toLowerCase() === "description");
-  const description = descriptionTag ? decodeHtmlText(attribute(descriptionTag, "content") || "") : "";
+  const { tokens } = tokenizeHtml(html);
+  let titleOpen = false;
+  let title = "";
+  let description = "";
+  let h1Count = 0;
+  for (const token of tokens) {
+    if (token.type === "start") {
+      if (token.name === "title") titleOpen = true;
+      if (token.name === "h1") h1Count += 1;
+      if (token.name === "meta" && token.attributes?.get("name")?.toLowerCase() === "description") {
+        description = token.attributes.get("content") || "";
+      }
+    } else if (token.type === "end" && token.name === "title") {
+      titleOpen = false;
+    } else if (token.type === "text" && titleOpen) {
+      title += token.text || "";
+    }
+  }
+  title = decodeHtmlEntities(title).replace(/\s+/g, " ").trim();
+  description = decodeHtmlEntities(description).replace(/\s+/g, " ").trim();
   return {
     titleLength: title.length,
     hasTitle: title.length > 0,
     descriptionLength: description.length,
     hasDescription: description.length > 0,
-    h1Count: (html.match(/<h1\b[^>]*>/gi) || []).length,
+    h1Count,
   };
 }
 
 function imageAccessibility(html: string): { imageCount: number; missingAltCount: number } {
-  const images = html.match(/<img\b[^>]*>/gi) || [];
-  const missingAltCount = images.filter((tag) => attribute(tag, "alt") === undefined).length;
+  const images = tokenizeHtml(html).tokens.filter((token) => token.type === "start" && token.name === "img");
+  const missingAltCount = images.filter((token) => !token.attributes?.has("alt")).length;
   return { imageCount: images.length, missingAltCount };
 }
 
@@ -378,8 +403,8 @@ function coverage(input: Omit<CoverageItem, "controlVerified">): CoverageItem {
 /** Perform one low-impact unauthenticated GET per exact approved page; do not crawl, follow redirects, or submit forms. */
 export async function executePublicReview(options: PublicReviewOptions): Promise<AuditResult> {
   const { scope } = options;
-  if (scope.mode !== "laboratory" || !scope.approvedServices.includes("passive-public-review")) {
-    throw new Error('Scope must approve the "passive-public-review" service in laboratory mode');
+  if ((scope.mode !== "laboratory" && scope.mode !== "scanner") || !scope.approvedServices.includes("passive-public-review")) {
+    throw new Error('Scope must approve the "passive-public-review" service in scanner mode');
   }
   if (scope.publicReadOnlyPages.length === 0) {
     throw new Error("Add exact public HTTPS pages to publicReadOnlyPages in the local scope.json before starting a passive review.");

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import test from "node:test";
 
-import { executePublicReview, isPublicAddress } from "./public-review.ts";
+import { executePublicReview, isPublicAddress, passivePublicGet } from "./public-review.ts";
 import type { PublicPageResponse, PublicPageTransport } from "./public-review.ts";
 import type { ScopeConfig } from "./scope.ts";
 
@@ -86,4 +87,145 @@ test("public address classifier rejects private, reserved, and local ranges", ()
   for (const address of ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"]) {
     assert.equal(isPublicAddress(address), true, `${address} should be accepted`);
   }
+});
+
+test("production GET transport pins a checked public DNS address and sends no credentials", async () => {
+  let requestOptions: Record<string, unknown> | undefined;
+  const dependencies = {
+    resolveAddresses: async () => [{ address: "8.8.8.8", family: 4 }],
+    makeRequest: (_url: URL, options: Record<string, unknown>, callback: (response: EventEmitter & Record<string, unknown>) => void) => {
+      requestOptions = options;
+      const request = Object.assign(new EventEmitter(), {
+        setTimeout: () => undefined,
+        destroy: (error?: Error) => { if (error) request.emit("error", error); },
+        end: () => {
+          const response = Object.assign(new EventEmitter(), {
+            statusCode: 200,
+            headers: { "content-type": "text/html; charset=utf-8" },
+            destroy: () => undefined,
+          });
+          queueMicrotask(() => {
+            callback(response as unknown as EventEmitter & Record<string, unknown>);
+            response.emit("data", Buffer.from("<h1>safe</h1>"));
+            response.emit("end");
+          });
+        },
+      });
+      return request;
+    },
+  } as never;
+  const response = await passivePublicGet("https://nodbim.com/", scope(), dependencies);
+  assert.equal(response.tlsCertificateValidation, "validated");
+  assert.equal(response.body, "<h1>safe</h1>");
+  assert.equal(requestOptions?.method, "GET");
+  assert.equal(requestOptions?.rejectUnauthorized, true);
+  assert.equal(requestOptions?.servername, "nodbim.com");
+  const headers = requestOptions?.headers as Record<string, string>;
+  assert.ok(!("authorization" in headers));
+  assert.ok(!("cookie" in headers));
+  assert.ok(!("referer" in headers));
+  let pinned: unknown;
+  (requestOptions?.lookup as (hostname: string, options: { all: boolean }, callback: (_error: Error | null, addresses: unknown[]) => void) => void)(
+    "nodbim.com", { all: true }, (_error, addresses) => { pinned = addresses[0]; },
+  );
+  assert.deepEqual(pinned, { address: "8.8.8.8", family: 4 });
+});
+
+test("production GET transport blocks private DNS answers before opening a request", async () => {
+  let requestCount = 0;
+  const dependencies = {
+    resolveAddresses: async () => [{ address: "127.0.0.1", family: 4 }],
+    makeRequest: () => { requestCount += 1; throw new Error("must not connect"); },
+  } as never;
+  await assert.rejects(passivePublicGet("https://nodbim.com/", scope(), dependencies), /non-public|reserved/i);
+  assert.equal(requestCount, 0);
+});
+
+test("production GET transport does not follow redirect destinations", async () => {
+  let requestCount = 0;
+  const dependencies = {
+    resolveAddresses: async () => [{ address: "8.8.8.8", family: 4 }],
+    makeRequest: (_url: URL, _options: unknown, callback: (response: EventEmitter & Record<string, unknown>) => void) => {
+      requestCount += 1;
+      const request = Object.assign(new EventEmitter(), {
+        setTimeout: () => undefined,
+        destroy: () => undefined,
+        end: () => {
+          const response = Object.assign(new EventEmitter(), {
+            statusCode: 302,
+            headers: { location: "https://outside.example/private?token=secret", "content-type": "text/html" },
+            destroy: () => undefined,
+          });
+          queueMicrotask(() => callback(response as unknown as EventEmitter & Record<string, unknown>));
+        },
+      });
+      return request;
+    },
+  } as never;
+  const response = await passivePublicGet("https://nodbim.com/", scope(), dependencies);
+  assert.equal(requestCount, 1);
+  assert.equal(response.status, 302);
+  assert.equal(response.bodyStatus, "unavailable");
+  assert.equal(response.headers.has("location"), false);
+});
+
+test("production GET transport rejects mixed public and private DNS answers before connecting", async () => {
+  let requestCount = 0;
+  const dependencies = {
+    resolveAddresses: async () => [
+      { address: "8.8.8.8", family: 4 },
+      { address: "fd00::1", family: 6 },
+    ],
+    makeRequest: () => { requestCount += 1; throw new Error("must not connect"); },
+  } as never;
+  await assert.rejects(passivePublicGet("https://nodbim.com/", scope(), dependencies), /non-public|invalid address/i);
+  assert.equal(requestCount, 0);
+});
+
+test("production GET transport aborts while resolving DNS before connecting", async () => {
+  let requestCount = 0;
+  const controller = new AbortController();
+  const dependencies = {
+    resolveAddresses: async () => new Promise<Array<{ address: string; family: number }>>(() => undefined),
+    makeRequest: () => { requestCount += 1; throw new Error("must not connect"); },
+  } as never;
+  const pending = passivePublicGet("https://nodbim.com/", scope(), dependencies, controller.signal);
+  controller.abort();
+  await assert.rejects(pending, /cancelled/i);
+  assert.equal(requestCount, 0);
+});
+
+test("production GET transport stops buffering at the per-page body budget", async () => {
+  let responseDestroyed = false;
+  const limits = scope();
+  const limitedScope = {
+    ...limits,
+    budgets: { ...limits.budgets, maxPublicBytesPerPage: 1024 },
+  };
+  const dependencies = {
+    resolveAddresses: async () => [{ address: "8.8.8.8", family: 4 }],
+    makeRequest: (_url: URL, _options: unknown, callback: (response: EventEmitter & Record<string, unknown>) => void) => {
+      const request = Object.assign(new EventEmitter(), {
+        setTimeout: () => undefined,
+        destroy: (error?: Error) => { if (error) request.emit("error", error); },
+        end: () => {
+          const response = Object.assign(new EventEmitter(), {
+            statusCode: 200,
+            headers: { "content-type": "text/html; charset=utf-8" },
+            destroy: () => { responseDestroyed = true; },
+          });
+          queueMicrotask(() => {
+            callback(response as unknown as EventEmitter & Record<string, unknown>);
+            response.emit("data", Buffer.from("x".repeat(2_000)));
+          });
+        },
+      });
+      return request;
+    },
+  } as never;
+  const response = await passivePublicGet("https://nodbim.com/", limitedScope, dependencies);
+  assert.equal(response.bytes, 1024);
+  assert.equal(response.bodyStatus, "unavailable");
+  assert.equal(response.body, "");
+  assert.equal(responseDestroyed, true);
 });

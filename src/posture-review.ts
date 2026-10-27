@@ -224,8 +224,8 @@ function pageEvidence(url: URL, response: PublicPageResponse, headers: Record<st
 /** Observe headers, TLS completion, and cookie flag counts for exact approved pages only. */
 export async function executePostureReview(options: PostureReviewOptions): Promise<AuditResult> {
   const { scope } = options;
-  if (scope.mode !== "laboratory" || !scope.approvedServices.includes("passive-public-review")) {
-    throw new Error('Scope must approve the "passive-public-review" service in laboratory mode');
+  if ((scope.mode !== "laboratory" && scope.mode !== "scanner") || !scope.approvedServices.includes("passive-public-review")) {
+    throw new Error('Scope must approve the "passive-public-review" service in scanner mode');
   }
   const maxPages = Math.min(POSTURE_REVIEW_MAX_PAGES, scope.budgets.maxPublicPages, scope.budgets.maxRequestsPerAudit);
   if (!Array.isArray(options.pages) || maxPages < 1 || options.pages.length === 0 || options.pages.length > maxPages) {
